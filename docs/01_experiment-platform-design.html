@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CMoE 実験基盤の設計計画</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    line-height: 1.8; max-width: 880px; margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    color: #1a1a1a; background: #fff;
+  }
+  h1 { font-size: 1.6rem; border-bottom: 2px solid #333; padding-bottom: .5rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.5rem; border-left: 4px solid #333; padding-left: .6rem; }
+  h3 { font-size: 1rem; margin-top: 1.6rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #ccc; padding: .5rem .65rem; text-align: left; vertical-align: top; }
+  th { background: #f2f2f2; font-weight: 600; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; background: #f2f2f2; padding: .1rem .3rem; border-radius: 3px; font-size: .88em; }
+  pre { background: #f7f7f7; border: 1px solid #ddd; border-radius: 6px; padding: .9rem 1rem; overflow-x: auto; font-size: .85rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  .note { background: #f7f7f7; border-left: 4px solid #888; padding: .75rem 1rem; margin: 1rem 0; font-size: .92rem; }
+  .warn { background: #fff8f0; border-left: 4px solid #d4a72c; padding: .75rem 1rem; margin: 1rem 0; font-size: .92rem; }
+  .decision { background: #f0f7ff; border-left: 4px solid #0969da; padding: .75rem 1rem; margin: 1rem 0; }
+  .meta { color: #666; font-size: .88rem; }
+  ul, ol { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6e6e6; background: #16181c; }
+    h1 { border-bottom-color: #666; } h2 { border-left-color: #888; }
+    th { background: #24272d; } th, td { border-color: #3a3f47; }
+    code { background: #24272d; }
+    .note, pre { background: #1c1f24; border-color: #3a3f47; }
+    .warn { background: #211d16; border-left-color: #9a6700; }
+    .decision { background: #172235; border-left-color: #58a6ff; }
+    .meta { color: #999; }
+  }
+</style>
+</head>
+<body>
+
+<h1>CMoE 実験基盤の設計計画</h1>
+<p class="meta">
+CMoE の training-free MoE 化研究を続けるための実験基盤を設計する。
+参照: <code>CMoE-ref/</code> の既存実装・レポート 01〜13・
+<a href="../CMoE-ref/docs/router-experiment-plan.md">ルーター差し替え実験の実装計画</a>。
+作成日: 2026-08-17
+</p>
+
+<div class="decision">
+<strong>目的</strong>
+<p>
+CMoE の training-free MoE 化研究を続けるための実験基盤をつくる。
+モデル差異を一箇所に閉じ込めた共通の土台の上で、SA 配分とルーターのアルゴリズムを
+単独でも同時でも差し替えて比較でき、データセットや探索手法を足すコストが小さい状態にする。
+</p>
+</div>
+
+<h2>背景・課題</h2>
+<p>
+既存の <code>CMoE-ref/</code> には、CMoE 公式実装を土台に2つのライブラリ層
+(<code>xsearch/</code>: 層別配分探索、<code>routerlab/</code>: ルーター差し替え)と、
+14 本・約 7,000 行の実験ドライバ <code>scripts/*.py</code> が積み上がっている。
+成果は出ているが、実験を1つ足すたびに 500〜800 行のドライバが1本増える構造になっている。
+</p>
+<p>
+原因は、<strong>差し替えたい対象が独立していないこと</strong>にある。
+モデル・データセット・配分アルゴリズム・ルーターアルゴリズムの4つが各ドライバの中で絡み合い、
+carving・診断・PPL 測定・ブートストラップまでドライバごとに抱えている。
+1つを変えるには、変えたくない部分ごと書き写すことになる。
+</p>
+<div class="note">
+本設計の要求は、突き詰めると一点に集約される —
+<strong>差し替えたいもの(モデル・配分・ルーター・データセット)が、それぞれ独立に差し替えられること</strong>。
+</div>
+
+<h2>要件</h2>
+<ul>
+  <li>モデルごとの差異は一箇所にまとめて閉じ込める。</li>
+  <li>異なるモデルでも実験ができる。</li>
+  <li>メインで読むコードは、モデルによる差異を気にしなくてよい。</li>
+  <li>ルーター改善のアルゴリズムと SA 配分のアルゴリズムを、それぞれ単独で適用できるし、同時にも適用できる。</li>
+  <li>SA 配分やルーターは今後「計算量を落とす探索」へ改善していくため、その追加実験を効率よく試せる。</li>
+  <li>評価データセット・キャリブレーションデータセットを、いろいろなものを効率よく試せる。</li>
+</ul>
+
+<h2>差し替え軸と境界</h2>
+<p>
+6 つの軸を立て、それぞれ「何を受け取り、何を返し、何をそこに閉じ込めるか」を決める。
+</p>
+
+<table>
+  <tr><th>軸</th><th>境界</th><th>入力</th><th>出力</th></tr>
+  <tr><td>1</td><td><code>ModelAdapter</code></td><td>モデル名/パス</td><td>層のリスト、正規形の dense FFN、FFN 差し替え操作、seqlen・dtype・tokenizer</td></tr>
+  <tr><td>2</td><td><code>DataSource</code></td><td>データセット名、seqlen、seed、本数</td><td><code>carve</code> / <code>fit</code> / <code>eval</code> のトークン列 + メタ</td></tr>
+  <tr><td>3</td><td><code>CarveMethod</code></td><td>dense FFN + carve データの活性統計、N</td><td><code>Partition</code>(expert グループ、代表候補)</td></tr>
+  <tr><td>4</td><td><code>RouterMethod</code></td><td><code>RouterBuildContext</code> + fit データ</td><td><code>nn.Module</code>(ルーター)</td></tr>
+  <tr><td>5</td><td><code>ScoreOracle</code> / <code>AllocationSearch</code></td><td>配分候補 / オラクルと予算</td><td>スコアと消費コスト / 配分ベクトル <code>x[L]</code></td></tr>
+  <tr><td>6</td><td><code>Evaluator</code></td><td>組み上がったモデル + eval split</td><td>PPL・NLL 列、ルーター診断値</td></tr>
+</table>
+
+<h3>1. モデル — <code>ModelAdapter</code></h3>
+<p>
+<strong>閉じ込めるもの</strong>: projection の名前、attention の呼び出し規約
+(transformers 4.47 の <code>rotary_emb</code> フォールバック依存など)、層リストへの経路、
+massive activation 層のような機種固有の事情。
+</p>
+<p>
+上位のコードは「層 ℓ の dense FFN」と「そこに MoE を差す」ことしか知らなくてよい。
+これが要件の1〜3をまとめて満たす軸である。
+</p>
+
+<h3>2. データ — <code>DataSource</code> → <code>Splits</code></h3>
+<p>
+<strong>閉じ込めるもの</strong>: データセットごとの取り出し方と、split 同士が重複しないための切り出し規則。
+出力にはトークンハッシュ・starts などのメタを含める。
+</p>
+<p class="meta">
+既存の <code>routerlab/data.py</code> がほぼこの形になっている。WikiText-2 固定である点を一般化する。
+</p>
+
+<h3>3. 分割 — <code>CarveMethod</code></h3>
+<p>
+<strong>閉じ込めるもの</strong>: 活性頻度による shared/routed の判定、共活性によるクラスタリング。
+</p>
+<div class="warn">
+出力する <code>Partition</code> には <strong>x に依存しない部分だけ</strong>を持たせる。
+現状の実装は x を変えると分割ごと動くため、配分とルーターを独立に扱うには、
+ここで x 非依存部分を切り離すことが前提になる。
+</div>
+
+<h3>4. ルーター — <code>RouterMethod</code></h3>
+<p>
+入力の <code>RouterBuildContext</code> では分割・x・Top-K が固定されており、メソッドはそれらに触れない。
+出力の <code>nn.Module</code> は、<code>dim</code> と <code>topk</code> が context と一致することを境界側で検査する。
+</p>
+<p class="meta">
+既存の <code>routerlab/contracts.py</code> がそのまま使える。8 方式が実装済み。
+</p>
+
+<h3>5. 配分 — <code>AllocationSearch</code> + <code>ScoreOracle</code>(2 枚に割る)</h3>
+<ul>
+  <li><strong><code>ScoreOracle</code></strong>: 配分候補を受け取り、スコアと<strong>消費コスト</strong>を返す。
+    実装は L(層ローカル・激安)、suffix KL、実 PPL(高価)と段階を持つ。</li>
+  <li><strong><code>AllocationSearch</code></strong>: オラクルと予算を受け取り、配分ベクトル <code>x[L]</code> を返す。
+    greedy / beam / 今後の安価な探索がここに並ぶ。</li>
+</ul>
+<p>
+この 2 枚割りが、「計算量を落とす探索」の実験点になる。
+探索アルゴリズムと、それがどのオラクルを何回叩いたかを、同じ土俵で比較できる。
+</p>
+
+<h3>6. 評価 — <code>Evaluator</code></h3>
+<p>
+PPL / NLL を、seed ごとの対応比較とブートストラップができる粒度で返す。
+ルーター診断(<code>|h|</code> 回収率、Oracle との一致率)も同じ境界が担う。
+</p>
+
+<h3>組み立て役</h3>
+<p>
+<code>Adapter × Data × Carve × Allocation × Router → Model</code> を実行し、<code>Evaluator</code> に渡す。
+</p>
+<p>
+<strong>配分だけ・ルーターだけ・両方</strong>は、軸 4 と 5 に「何もしない既定」を入れるだけで表現できる。
+report/13 の 2×2 表がそのまま 1 本のドライバから出る形になる。
+</p>
+
+<h2>ディレクトリ構造</h2>
+
+<pre><code>src/cmoe/
+  moe/            変換後に載る実体: MoE / Expert / Router(nn.Module)
+  adapters/       [軸1] base.py(DenseFFN, ModelAdapter) llama.py registry.py
+  data/           [軸2] base.py(Splits) wikitext2.py c4.py registry.py
+  carve/          [軸3] base.py(Partition, CarveMethod) profile.py(活性統計) cmoe.py
+  router/         [軸4] base.py(Context, RouterMethod) methods/*.py oracle.py(診断用)
+  alloc/          [軸5] base.py(Allocation, Search, ScoreOracle)
+                        oracles/  local_error.py suffix_kl.py ppl.py
+                        search/    uniform.py greedy.py beam.py
+  eval/           [軸6] ppl.py diagnostics.py stats.py(bootstrap)
+  assemble.py     組み立て役: Adapter×Data×Carve×Alloc×Router → Model
+  runlog.py       実行記録(tee + JSON + 上書き拒否)
+  cli.py          唯一のドライバ
+
+tests/            src/cmoe/ と同じ形に対応
+experiments/      1実験1ファイルの薄い設定 (例: 13_alloc_x_router.py)
+reports/          日本語レポート(既存 01〜13 を移送)
+docs/             設計・計画
+third_party/cmoe-ref/   元実装。参照専用・import しない
+result_logs/      一次データ(gitignore)</code></pre>
+
+<h3>registry を置くのは差し替え軸だけ</h3>
+<p>
+<code>adapters</code> / <code>data</code> / <code>carve</code> / <code>router</code> と、
+<code>alloc</code> の search・oracle に <code>registry.py</code> を置く。
+CLI は文字列を受けて registry で解決するだけとし、<code>if method == ...</code> を一切持たない。
+既存の <code>routerlab/registry.py</code> の方式を横展開する。
+</p>
+
+<h3>experiments/ が scripts/ を置き換える</h3>
+<p>
+現行の 700 行ドライバが肥大している原因は、carving・診断・PPL 測定・ブートストラップを各自が抱えている点にある。
+それらはすべて <code>assemble.py</code> と <code>eval/</code> に入る。
+実験ファイルに残るのは「どの軸に何を挿すか」と「何を比較するか」だけで、数十行に収まる。
+report/13 の 2×2 表は <code>alloc ∈ {uniform3, beam}</code> × <code>router ∈ {cmoe, oracle_recovery}</code>
+のループ 1 つで出る。
+</p>
+
+<h3>alloc の 2 枚割りが探索コスト実験の要</h3>
+<p>
+<code>alloc/oracles/</code> と <code>alloc/search/</code> を別ディレクトリにする。
+オラクルは「候補 → (スコア, 消費コスト)」だけを返し、探索はオラクルの中身を知らない。
+新しい安価オラクルも、新しい探索アルゴリズムも、片方だけを足せる。
+</p>
+
+<h3>依存の向き</h3>
+<pre><code>moe ← adapters ← carve ← {router, alloc} ← assemble ← eval ← cli/experiments</code></pre>
+<p>
+一方向に保ち、逆流させない。<code>router</code> と <code>alloc</code> は互いを import しない。
+<strong>両方を同時に使う知識は <code>assemble.py</code> にだけ置く。</strong>
+</p>
+
+<h3>third_party/cmoe-ref は import しない</h3>
+<p>
+現状の <code>routerlab → xsearch</code> のような依存を残すと、元実装の制約がそのまま新基盤に染み出す。
+移すべきロジックは <code>src/cmoe/</code> 側へ書き直し、元実装は数値比較の参照元としてのみ保持する。
+</p>
+
+</body>
+</html>
