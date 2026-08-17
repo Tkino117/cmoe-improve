@@ -58,6 +58,22 @@ def parse_seeds(spec):
     return [int(field) for field in parse_list(spec)]
 
 
+def parse_alloc_specs(spec):
+    """``--alloc`` を、直積に回す配分の並びに割る。
+
+    カンマが2つの意味を持つ — 配分の並び（``uniform3,beam``）と、層ごとの値を
+    並べた1本のベクトル（``3,6,6,...``）である。区別は「全部が数字か」で付く。
+    配分の**名前**が数字だけになることは無いので、これは曖昧にならない。
+
+    この判別が無いと、``search`` が「そのまま貼れる」と印字したベクトルを
+    ``run`` が32個の未知の配分名として読む。探索の結果を使う経路がそこで切れる。
+    """
+    fields = parse_list(spec)
+    if len(fields) > 1 and all(field.lstrip('-').isdigit() for field in fields):
+        return [spec]
+    return fields
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog='cmoe')
     sub = parser.add_subparsers(dest='command', required=True)
@@ -160,7 +176,7 @@ def configure_method(method, args):
 def configurations(args):
     """(配分名, ルーター名) の直積。先頭が対照になる。"""
     rows = []
-    for alloc in parse_list(args.alloc):
+    for alloc in parse_alloc_specs(args.alloc):
         for router in parse_list(args.router):
             rows.append((alloc, router))
     return rows
@@ -335,7 +351,7 @@ def summarize(records, configs, datasets, reps, seed):
 
 def command_run(args):
     configs = configurations(args)
-    allocs = parse_list(args.alloc)
+    allocs = parse_alloc_specs(args.alloc)
     routers = parse_list(args.router)
     seeds = parse_seeds(args.seeds)
     datasets = parse_list(args.datasets)

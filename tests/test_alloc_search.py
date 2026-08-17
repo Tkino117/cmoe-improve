@@ -11,6 +11,7 @@ import pytest
 from cmoe.alloc.base import Allocation, ScoreResult
 from cmoe.alloc.search.beam import (BeamEntry, BudgetExceeded, GreedySearch,
                                     TopBeam, parent_ranks)
+from cmoe.alloc.search.fixed import parse_allocation
 from cmoe.alloc.search.registry import create_search
 
 # 貪欲が必ず外す盤面。層0 は x=1 がその場の最善（0.5）だが、その先は 0.9 までしか
@@ -246,6 +247,31 @@ def test_greedy_refuses_a_width_it_would_have_ignored():
 def test_unknown_search_names_are_refused():
     with pytest.raises(ValueError, match='未知の探索'):
         create_search('annealing')
+
+
+def test_a_searched_allocation_can_be_pasted_into_run():
+    """``search`` が印字したベクトルを ``run --alloc`` がそのまま受ける。
+
+    ``--alloc`` のカンマは2つの意味を持つ — 配分の並び（直積に回す）と、層ごとの
+    値を並べた1本のベクトル。区別が無いと、32層のベクトルが32個の未知の配分名に
+    なり、探索の結果を使う経路がそこで切れる。実機で踏んだ。
+    """
+    from cmoe.cli import build_parser, configurations, parse_alloc_specs
+
+    searched = '3,6,6,6,5,5,5,6,6,6,6,6,6,6,6,5,6,5,6,5,5,6,6,6,6,6,4,4,2,3,4,5'
+    assert parse_alloc_specs(searched) == [searched]      # 1本のベクトル
+    assert parse_alloc_specs('uniform3,beam') == ['uniform3', 'beam']
+    assert parse_alloc_specs('beam') == ['beam']
+
+    # 直積の側から見ても1構成にしかならない
+    args = build_parser().parse_args(
+        ['run', '--alloc', searched, '--router', 'cmoe,oracle_recovery'])
+    assert configurations(args) == [(searched, 'cmoe'),
+                                    (searched, 'oracle_recovery')]
+    # そのベクトルが実際に配分として解ける
+    allocation = parse_allocation(searched, n_active_total=6).search(None, 32)
+    assert len(allocation) == 32
+    assert allocation[0] == 3
 
 
 def test_argument_errors_surface_before_the_model_is_loaded():
