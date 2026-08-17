@@ -11,6 +11,11 @@ CALIBRATION_SETS = {
     'c4': c4.calibration,
 }
 
+# ルーター方式が要る carve / fit / validation の3本組。
+SPLIT_SETS = {
+    'wikitext2': wikitext2.splits,
+}
+
 EVALUATION_SETS = {
     'wikitext2': wikitext2.evaluation,
     'c4-new': c4.evaluation,
@@ -34,3 +39,15 @@ def load_evaluation(name, model, seqlen):
         raise ValueError(
             f'未知の評価セット {name!r}。{sorted(EVALUATION_SETS)} から選ぶ') from None
     return loader(model, seqlen)
+
+
+def load_splits(name, model, seqlen, seed, carve_count=8, fit_count=64,
+                validation_count=64):
+    """carve / fit / validation の3本。ルーター方式を作るのに要る。"""
+    try:
+        loader = SPLIT_SETS[name]
+    except KeyError:
+        raise ValueError(
+            f'{name!r} には carve/fit/validation の分割が無い。'
+            f'{sorted(SPLIT_SETS)} から選ぶ') from None
+    return loader(model, seqlen, seed, carve_count, fit_count, validation_count)

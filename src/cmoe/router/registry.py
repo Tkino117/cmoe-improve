@@ -1,10 +1,32 @@
 """ルーター方式名の解決。CLI に方式の分岐を持たせないための唯一の場所。"""
 
 from cmoe.router.methods.cmoe import CMoEMethod
+from cmoe.router.methods.expert_mean import (CenteredExpertMeanMethod,
+                                             ExpertMeanMethod)
+from cmoe.router.methods.frequency_centroid import FrequencyCentroidMethod
+from cmoe.router.methods.oracle_abs import OracleAbsMethod
+from cmoe.router.methods.oracle_correlation import OracleCorrelationMethod
+from cmoe.router.methods.oracle_recovery import OracleRecoveryMethod
 
 METHODS = {
+    # 方式1: 現行 CMoE。すべての実験の対照
     'cmoe': CMoEMethod,
+    # 方式2: 活性頻度で重み付けした重心
+    'freq_centroid': FrequencyCentroidMethod,
+    # 方式3: expert 質量との Pearson 相関が最大の代表
+    'oracle_correlation': OracleCorrelationMethod,
+    # 方式4: 回収率の共同最適化（本命）
+    'oracle_recovery': OracleRecoveryMethod,
+    # 方式6: expert の行の平均
+    'expert_mean': ExpertMeanMethod,
+    'expert_mean_centered': CenteredExpertMeanMethod,
+    # 診断専用: 真の |h| を読むオラクル。配備できない
+    'oracle_abs': OracleAbsMethod,
 }
+
+# 方式4 は先行方式の代表集合から座標上昇を始めるので、この順に構築する。
+# 途中の方式を飛ばすと出発点が減り、別の答えになる。
+RECOVERY_CHAIN = ('cmoe', 'freq_centroid', 'oracle_correlation', 'oracle_recovery')
 
 
 def create_method(name):
@@ -14,3 +36,25 @@ def create_method(name):
         raise ValueError(
             f'未知のルーター方式 {name!r}。{sorted(METHODS)} から選ぶ') from None
     return method()
+
+
+def resolve_chain(names):
+    """要求された方式を、依存を満たす構築順に並べ直す。
+
+    ``oracle_recovery`` は初期代表集合を要求するので、先行3方式を前に挿す。
+    それ以外の方式は互いに独立なので、要求された順のまま後ろに置く。
+    """
+    requested = list(dict.fromkeys(names))
+    order = []
+    if 'oracle_recovery' in requested:
+        order.extend(RECOVERY_CHAIN)
+    for name in requested:
+        if name not in order:
+            order.append(name)
+    if 'cmoe' not in order:
+        # 対照であり、carve の伝播に使うルーターでもあるので必ず先頭に置く
+        order.insert(0, 'cmoe')
+    elif order[0] != 'cmoe':
+        order.remove('cmoe')
+        order.insert(0, 'cmoe')
+    return order

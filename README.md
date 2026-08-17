@@ -15,7 +15,10 @@ uv sync
 uv run cmoe run --alloc uniform3 --router cmoe
 
 # 配分とルーターの直積。report/13 の 2×2 表はこの形で出る
-uv run cmoe run --alloc uniform3,beam --router cmoe --seeds 0,1,2
+uv run cmoe run --alloc uniform3,beam --router cmoe,oracle_recovery --seeds 0,1,2
+
+# ルーターの診断だけ（回収率・Oracle 一致率）
+uv run cmoe run --router oracle_recovery --diagnostics --no-ppl
 
 # 移送が既存の測定と同じ数字を出すかの確認
 uv run python experiments/00_anchor.py
@@ -49,11 +52,13 @@ tests/        CPU で数秒で回る動作確認
 ## 状態
 
 移送済み: 軸1〜4 と6 の全体、軸5 の適用側（配分ベクトルをモデルに反映する経路）。
-アダプタは Llama 系（既存の測定を再現する経路）と、同じ層構造の他モデルを
-`AutoModelForCausalLM` で読む `auto` の2つ。
 
-未移送: 配分の探索アルゴリズム（beam / greedy）と採点オラクル、
-現行 CMoE 以外のルーター方式。既知の配分は
+- アダプタ: `llama`（既存の測定を再現する経路）、`auto`（同じ層構造の他モデル）
+- ルーター方式: 現行 CMoE、頻度重心、Oracle 相関、回収率の共同最適化、
+  expert 平均（素/centered）、診断用 `|h|` オラクル
+- ルーター診断: `|h|` 回収率、Oracle gap 回収率、Top-K の recall と完全一致率
+
+未移送: 配分の探索アルゴリズム（beam / greedy）と採点オラクル。既知の配分は
 `src/cmoe/alloc/presets.py` に定数として置いてある。
 
 元実装と過去のレポートは `CMoE-ref/`（追跡対象外）にある。

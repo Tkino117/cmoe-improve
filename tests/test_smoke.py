@@ -40,7 +40,7 @@ def token_set(name, shape, seed=0):
 
 def convert(adapter, x, router='cmoe'):
     converter = Converter(
-        adapter, create_carver('cmoe', N_EXPERTS), create_method(router),
+        adapter, create_carver('cmoe', N_EXPERTS), [create_method(router)],
         n_experts=N_EXPERTS)
     allocation = Allocation(tuple([x] * adapter.n_layers), name=f'uniform{x}',
                             n_active_total=N_ACTIVE)
@@ -74,7 +74,7 @@ def test_allocation_keeps_total_active_fixed():
 
 def test_per_layer_allocation_reaches_the_layers(adapter):
     converter = Converter(
-        adapter, create_carver('cmoe', N_EXPERTS), create_method('cmoe'),
+        adapter, create_carver('cmoe', N_EXPERTS), [create_method('cmoe')],
         n_experts=N_EXPERTS)
     allocation = Allocation((1, 3), name='mixed', n_active_total=N_ACTIVE)
     report = converter.convert(token_set('calib', (2, SEQLEN)), allocation)
@@ -94,7 +94,7 @@ def test_router_method_may_not_change_the_partition(adapter):
             return Router(context.hidden_size, context.n_routed, context.topk + 1)
 
     converter = Converter(
-        adapter, create_carver('cmoe', N_EXPERTS), Broken(), n_experts=N_EXPERTS)
+        adapter, create_carver('cmoe', N_EXPERTS), [Broken()], n_experts=N_EXPERTS)
     allocation = Allocation(tuple([1] * adapter.n_layers), n_active_total=N_ACTIVE)
     with pytest.raises(ValueError, match='topk'):
         converter.convert(token_set('calib', (2, SEQLEN)), allocation)
@@ -103,7 +103,7 @@ def test_router_method_may_not_change_the_partition(adapter):
 def test_partial_conversion_leaves_the_rest_dense(adapter):
     """--layers 用の経路。先頭だけ変換し、残りは dense のまま動く。"""
     converter = Converter(
-        adapter, create_carver('cmoe', N_EXPERTS), create_method('cmoe'),
+        adapter, create_carver('cmoe', N_EXPERTS), [create_method('cmoe')],
         n_experts=N_EXPERTS, n_layers=1)
     allocation = Allocation((2,), name='uniform2', n_active_total=N_ACTIVE)
     report = converter.convert(token_set('calib', (2, SEQLEN)), allocation)

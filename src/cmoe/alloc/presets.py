@@ -8,17 +8,10 @@
 N_LAYERS = 32
 N_ACTIVE = 6
 
+# 一様配分（uniform0〜uniform6）はここに無い。層数に依存しないので
+# ``parse_allocation`` が名前から直接組む — 32 層のベクトルとして持つと、
+# 別の層数のモデルで使えなくなる。
 PRESETS = {
-    # 一様配分。x=3 は report/10・13 のルーター実験の土台、x=4 は n=8 一様
-    # スイープの最良。
-    'uniform0': [0] * N_LAYERS,
-    'uniform1': [1] * N_LAYERS,
-    'uniform2': [2] * N_LAYERS,
-    'uniform3': [3] * N_LAYERS,
-    'uniform4': [4] * N_LAYERS,
-    'uniform5': [5] * N_LAYERS,
-    'uniform6': [6] * N_LAYERS,
-
     # 層ごとに独立に決めた貪欲配分。出典は
     # result_logs/oracle_20260809_012659/r_oracle_squared.txt（R 系）と
     # result_logs/ltable_20260809_182828/l_table.json（L・KL 系）。

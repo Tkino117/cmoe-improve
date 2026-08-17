@@ -1,16 +1,19 @@
 """アンカー: 移送した基盤が、既存の測定と同じ数字を出すか。
 
-CMoE-ref の一次結果から2構成を選んで固定値として置いてある。片方はルーターの
-経路まで、もう片方は配分の適用まで通る。
+CMoE-ref の一次結果から5構成を選んで固定値として置いてある。それぞれ通る経路が
+違い、合わせて軸1〜6 の全部を覆う。
 
-  A: 一様 x=3 + 現行ルーター … 軸1〜4 と6
-  B: ビーム配分 + 現行ルーター … 上記 + 軸5 の適用側
+  A: 一様 x=3 + 現行ルーター      … 軸1〜4 と6
+  B: ビーム配分 + 現行ルーター    … 上記 + 軸5 の適用側
+  C: 一様 x=3 + 方式4             … 上記 + fit 分割とルーター方式の連鎖
+  D: ビーム配分 + 方式4           … 配分とルーターを同時に入れた組み合わせ
+  E: 一様 x=3 + |h| オラクル      … 診断用ルーター（配備できない上限）
 
-探索アルゴリズムの再現は求めない（浮動小数の順序ひとつで分岐が変わる）。B は
+探索アルゴリズムの再現は求めない（浮動小数の順序ひとつで分岐が変わる）。B・D は
 report/06 の配分ベクトルを定数として適用した結果だけを見る。
 
-  uv run python experiments/00_anchor.py          # 両方
-  uv run python experiments/00_anchor.py --only A
+  uv run python experiments/00_anchor.py          # 全部
+  uv run python experiments/00_anchor.py --only C
 """
 
 import argparse
@@ -20,7 +23,7 @@ import sys
 
 from cmoe.cli import main as cli_main
 
-# 出典: report/13 の seed 別 PPL 表（carve n=8, seed 0, N=8, A=6）
+# 出典: report/13 の seed 別 PPL 表（carve n=8, fit n=64, seed 0, N=8, A=6）
 ANCHORS = {
     'A': {
         'alloc': 'uniform3',
@@ -31,6 +34,22 @@ ANCHORS = {
         'alloc': 'beam',
         'router': 'cmoe',
         'expected': {'wikitext2': 6.941375, 'c4-new': 10.268085},
+    },
+    'C': {
+        'alloc': 'uniform3',
+        'router': 'oracle_recovery',
+        'expected': {'wikitext2': 7.003395, 'c4-new': 10.232112},
+    },
+    'D': {
+        'alloc': 'beam',
+        'router': 'oracle_recovery',
+        'expected': {'wikitext2': 6.942683, 'c4-new': 10.288317},
+    },
+    # 出典: report/07 の表（x=3 の行）。この実行は wikitext2 しか測っていない
+    'E': {
+        'alloc': 'uniform3',
+        'router': 'oracle_abs',
+        'expected': {'wikitext2': 6.638487},
     },
 }
 
@@ -47,12 +66,13 @@ def run(name, out_root):
         '--alloc', anchor['alloc'],
         '--router', anchor['router'],
         '--seeds', '0',
+        '--datasets', ','.join(anchor['expected']),
         '--out', out,
     ])
     with open(os.path.join(out, 'summary.json')) as handle:
         summary = json.load(handle)
-    measured = {name: row['ppl']
-                for name, row in summary['runs'][0]['ppl'].items()}
+    measured = {dataset: row['ppl']
+                for dataset, row in summary['runs'][0]['ppl'][anchor['router']].items()}
     rows = []
     for dataset, expected in anchor['expected'].items():
         got = measured[dataset]
@@ -78,5 +98,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     names = [args.only] if args.only else sorted(ANCHORS)
-    passed = all(report(name, run(name, args.out_root)) for name in names)
+    results = [(name, run(name, args.out_root)) for name in names]
+    passed = all(report(name, rows) for name, rows in results)
     sys.exit(0 if passed else 1)

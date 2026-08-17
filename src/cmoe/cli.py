@@ -1,10 +1,13 @@
 """唯一のドライバ。
 
 配分とルーターをそれぞれ複数指定できる。両方に複数を渡せばその直積が走るので、
-report/13 の 2×2 表（一様 x=3 / ビーム配分 × 現行ルーター / 改良ルーター）は
+report/13 の 2×2 表（一様 x=3 / ビーム配分 × 現行ルーター / 方式4）は
 1コマンドで出る。
 
-  cmoe run --alloc uniform3,beam --router cmoe --datasets wikitext2,c4-new
+  cmoe run --alloc uniform3,beam --router cmoe,oracle_recovery --seeds 0,1,2
+
+同じ配分のルーター違いは**1回の変換**でまかなう。carve も expert 重みも共有し、
+``MoE.gate`` だけを差し替えて評価するので、比較が「ルーターだけの差」になる。
 
 方式の分岐はここに無い。名前は各軸の registry が解決する。
 """
@@ -20,12 +23,13 @@ import torch
 from cmoe import runlog
 from cmoe.adapters.registry import create_adapter, guess_adapter
 from cmoe.alloc.search.fixed import parse_allocation
+from cmoe.assemble import Converter, install_routers
 from cmoe.carve.registry import create_carver
-from cmoe.data.registry import load_calibration, load_evaluation
+from cmoe.data.registry import load_calibration, load_evaluation, load_splits
 from cmoe.eval.ppl import evaluate_ppl
 from cmoe.eval.stats import paired_differences, stratified_paired_bootstrap
-from cmoe.router.registry import create_method
-from cmoe.assemble import Converter
+from cmoe.router.diagnostics import gap_recovered
+from cmoe.router.registry import create_method, resolve_chain
 
 TEXT_NAME, JSON_NAME = 'run.txt', 'summary.json'
 log = runlog.log
@@ -45,18 +49,23 @@ def build_parser():
 
     run = sub.add_parser('run', help='変換して perplexity を測る')
     run.add_argument('--model', default='meta-llama/Llama-2-7b-hf')
-    run.add_argument('--adapter', default=None,
-                     help='省略時はモデル名から推測する')
+    run.add_argument('--adapter', default=None, help='省略時はモデル名から推測する')
     run.add_argument('--alloc', default='uniform3',
-                     help='配分。プリセット名か層数分のカンマ区切り。カンマ区切りの'
-                          'プリセット名を複数渡すと直積で走る')
-    run.add_argument('--router', default='cmoe', help='ルーター方式（複数可）')
+                     help='配分。プリセット名か層数分のカンマ区切り。複数渡すと直積')
+    run.add_argument('--router', default='cmoe',
+                     help='ルーター方式（複数可）。方式4 は先行方式を自動で前に挿す')
     run.add_argument('--carver', default='cmoe', help='分割方式')
     run.add_argument('--calib', default='wikitext2', help='キャリブレーションセット')
     run.add_argument('--datasets', default='wikitext2,c4-new', help='評価セット')
     run.add_argument('--seeds', default='0', help='キャリブレーションの seed')
     run.add_argument('--nsamples', type=int, default=8,
                      help='carve に使う系列数。既存の測定はすべて 8')
+    run.add_argument('--fit-samples', type=int, default=64,
+                     help='ルーター方式が代表を選ぶのに使う系列数')
+    run.add_argument('--validation-samples', type=int, default=64,
+                     help='ルーター診断に使う系列数')
+    run.add_argument('--diagnostics', action='store_true',
+                     help='回収率と Oracle 一致率を層ごとに測る（validation が要る）')
     run.add_argument('--nexperts', type=int, default=8)
     run.add_argument('--nactive', type=int, default=6,
                      help='1トークンあたりに走る expert 数 A。全構成で同じ')
@@ -65,13 +74,38 @@ def build_parser():
     run.add_argument('--seqlen', type=int, default=2048)
     run.add_argument('--batch-chunk', type=int, default=None,
                      help='carve 中にバッチを分ける幅。n が大きいときだけ要る')
+    run.add_argument('--fit-batch-chunk', type=int, default=4,
+                     help='fit / validation を進めるときのバッチ幅')
+    run.add_argument('--token-chunk', type=int, default=4096,
+                     help='ルーター方式がトークンを分けて進める幅')
+    run.add_argument('--search-token-chunk', type=int, default=8192,
+                     help='方式4 の座標上昇がトークンを分けて進める幅')
+    run.add_argument('--keep-top', type=int, default=16,
+                     help='方式3 が記録する上位候補の数')
+    run.add_argument('--max-sweeps', type=int, default=10,
+                     help='方式4 の座標上昇の掃引上限')
     run.add_argument('--no-profiling-norm', action='store_true')
     run.add_argument('--no-router-norm', action='store_true')
     run.add_argument('--layers', type=int, default=None,
                      help='先頭 N 層だけ変換する（動作確認用）')
+    run.add_argument('--no-ppl', action='store_true',
+                     help='PPL を測らない。診断だけ見るとき')
     run.add_argument('--bootstrap-reps', type=int, default=10000)
+    run.add_argument('--bootstrap-seed', type=int, default=20260813)
     run.add_argument('--out', default=None)
     return parser
+
+
+def configure_method(method, args):
+    """CLI の分割幅を方式へ渡す。方式ごとの分岐ではなく、持っていれば設定する。"""
+    for name, value in (('chunk_size', args.token_chunk),
+                        ('keep_top', args.keep_top),
+                        ('max_sweeps', args.max_sweeps)):
+        if hasattr(method, name):
+            setattr(method, name, value)
+    if hasattr(method, 'token_chunk'):
+        method.token_chunk = args.search_token_chunk
+    return method
 
 
 def configurations(args):
@@ -83,15 +117,43 @@ def configurations(args):
     return rows
 
 
-def run_one(args, alloc_spec, router_name, seed, evaluation_sets):
-    """1構成 × 1 seed。モデルは構成ごとに読み直す（変換は破壊的）。"""
+def load_carving_data(args, seed, methods):
+    """carve と、必要なら fit / validation を読む。
+
+    fit を読むのは、それを要求する方式があるときだけ。要らないときに 64 系列を
+    トークナイズして流すのは、そのぶん丸ごと無駄になる。
+    """
+    needs_fit = any(getattr(method, 'requires_fit_z', False) for method in methods)
+    if not needs_fit and not args.diagnostics:
+        carve = load_calibration(
+            args.calib, args.model, args.seqlen, args.nsamples, seed)
+        return carve, None, None
+    splits = load_splits(
+        args.calib, args.model, args.seqlen, seed,
+        carve_count=args.nsamples, fit_count=args.fit_samples,
+        validation_count=args.validation_samples)
+    validation = splits.validation if args.diagnostics else None
+    return splits.carve, splits.fit, validation
+
+
+def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
+    """1配分 × 1 seed。要求された全ルーター方式を1回の変換でまかなう。"""
     adapter_name = args.adapter or guess_adapter(args.model)
     adapter = create_adapter(adapter_name, args.model, seqlen=args.seqlen)
 
-    calibration = load_calibration(
-        args.calib, args.model, args.seqlen, args.nsamples, seed)
-    log(f'  carve: {calibration.name} {tuple(calibration.input_ids.shape)} '
-        f'hash={calibration.metadata()["token_hash"][:12]}')
+    build_order = resolve_chain(router_names)
+    methods = [configure_method(create_method(name), args) for name in build_order]
+    carve, fit, validation = load_carving_data(args, seed, methods)
+    log(f'  carve: {carve.name} {tuple(carve.input_ids.shape)} '
+        f'hash={carve.metadata()["token_hash"][:12]}')
+    if fit is not None:
+        log(f'  fit:   {fit.name} {tuple(fit.input_ids.shape)} '
+            f'hash={fit.metadata()["token_hash"][:12]}')
+    if validation is not None:
+        log(f'  val:   {validation.name} {tuple(validation.input_ids.shape)} '
+            f'hash={validation.metadata()["token_hash"][:12]}')
+    if build_order != list(dict.fromkeys(router_names)):
+        log(f'  構築順: {" -> ".join(build_order)}')
 
     search = parse_allocation(alloc_spec, n_active_total=args.nactive)
     n_layers = args.layers or adapter.n_layers
@@ -100,34 +162,55 @@ def run_one(args, alloc_spec, router_name, seed, evaluation_sets):
     converter = Converter(
         adapter,
         create_carver(args.carver, args.nexperts),
-        create_method(router_name),
+        methods,
         n_experts=args.nexperts,
         k_act=args.k_act,
         bias_speed=args.bias_speed,
         profiling_norm=not args.no_profiling_norm,
         router_norm=not args.no_router_norm,
         batch_chunk=args.batch_chunk,
+        fit_batch_chunk=args.fit_batch_chunk,
+        token_chunk=args.token_chunk,
         n_layers=args.layers,
         log=lambda message: None,
     )
     started = time.time()
-    report = converter.convert(calibration, allocation)
+    report = converter.convert(carve, allocation, fit=fit, validation=validation)
     log(f'  変換 {report.seconds:.1f}s (平均 x={allocation.mean_x:.2f})')
 
+    diagnostics = summarize_diagnostics(report)
+    for name, values in diagnostics.items():
+        log(f'  診断 {name:<20} R={values["router_r"]:.6f} '
+            f'gap回収={values["gap_recovered"]:.2%} '
+            f'recall={values["oracle_mean_recall"]:.4f} '
+            f'一致率={values["oracle_exact_set_rate"]:.4f}')
+
     results = {}
-    for name, token_set in evaluation_sets.items():
-        result = evaluate_ppl(adapter, token_set)
-        results[name] = result
-        log(f'  {name}: {result.ppl:.6f}')
+    if not args.no_ppl:
+        for name in router_names:
+            install_routers(adapter, report.routers[name])
+            results[name] = {}
+            for dataset, token_set in evaluation_sets.items():
+                result = evaluate_ppl(adapter, token_set)
+                results[name][dataset] = result
+                log(f'  {name:<20} {dataset:<10} {result.ppl:.6f}')
 
     payload = {
         'allocation': allocation.metadata(),
-        'router': router_name,
+        'routers': list(router_names),
+        'build_order': build_order,
         'carver': args.carver,
         'seed': seed,
-        'calibration': calibration.metadata(),
+        'data': {
+            'carve': carve.metadata(),
+            'fit': fit.metadata() if fit is not None else None,
+            'validation': validation.metadata() if validation is not None else None,
+        },
         'conversion': report.as_dict(),
-        'ppl': {name: result.as_dict() for name, result in results.items()},
+        'diagnostics': diagnostics,
+        'ppl': {name: {dataset: result.as_dict()
+                       for dataset, result in rows.items()}
+                for name, rows in results.items()},
         'seconds': time.time() - started,
     }
 
@@ -137,7 +220,38 @@ def run_one(args, alloc_spec, router_name, seed, evaluation_sets):
     return payload, results
 
 
-def summarize(records, configs, datasets, reps):
+def summarize_diagnostics(report):
+    """層ごとの診断を、routing する層の平均にまとめる。
+
+    Top-K=0 の層は入らない。何も選ばない層では回収率は全方式で shared 質量に
+    等しく、平均に混ぜると方式の差が薄まるだけである（report/13 と同じ扱い）。
+    """
+    rows = [record.diagnostics for record in report.layers if record.diagnostics]
+    if not rows:
+        return {}
+    baseline = report.baseline_method
+    summary = {}
+    for name in rows[0]:
+        values = [row[name] for row in rows]
+        router_r = sum(value['router_r'] for value in values) / len(values)
+        oracle_r = sum(value['oracle_r'] for value in values) / len(values)
+        baseline_r = sum(row[baseline]['router_r'] for row in rows) / len(rows)
+        recovered = gap_recovered(baseline_r, router_r, oracle_r)
+        summary[name] = {
+            'router_r': router_r,
+            'oracle_r': oracle_r,
+            'baseline_r': baseline_r,
+            'gap_recovered': recovered if recovered is not None else 0.0,
+            'oracle_mean_recall': sum(
+                value['oracle_mean_recall'] for value in values) / len(values),
+            'oracle_exact_set_rate': sum(
+                value['oracle_exact_set_rate'] for value in values) / len(values),
+            'n_routing_layers': len(values),
+        }
+    return summary
+
+
+def summarize(records, configs, datasets, reps, seed):
     """構成ごとの平均 PPL と、先頭構成に対する対応のある差。"""
     summary = {'configurations': [], 'baseline': f'{configs[0][0]}+{configs[0][1]}'}
     baseline_key = configs[0]
@@ -164,7 +278,7 @@ def summarize(records, configs, datasets, reps):
                         base['ppl'][dataset], record['ppl'][dataset]))
                 if differences:
                     entry['paired_vs_baseline'] = stratified_paired_bootstrap(
-                        differences, reps=reps)
+                        differences, reps=reps, seed=seed)
             row['datasets'][dataset] = entry
         summary['configurations'].append(row)
     return summary
@@ -172,6 +286,8 @@ def summarize(records, configs, datasets, reps):
 
 def command_run(args):
     configs = configurations(args)
+    allocs = parse_list(args.alloc)
+    routers = parse_list(args.router)
     seeds = parse_seeds(args.seeds)
     datasets = parse_list(args.datasets)
 
@@ -181,16 +297,18 @@ def command_run(args):
 
     log(f'model={args.model} carve={args.calib} n={args.nsamples} '
         f'N={args.nexperts} A={args.nactive}')
-    log(f'構成 {len(configs)} 種 × seed {len(seeds)} 本 = '
-        f'{len(configs) * len(seeds)} 実行')
+    log(f'配分 {len(allocs)} 種 × ルーター {len(routers)} 種 × seed {len(seeds)} 本 '
+        f'= 変換 {len(allocs) * len(seeds)} 回 / 評価 {len(configs) * len(seeds)} 通り')
     log(f'出力 {out}')
 
-    evaluation_sets = {
-        name: load_evaluation(name, args.model, args.seqlen) for name in datasets}
-    for name, token_set in evaluation_sets.items():
-        meta = token_set.metadata()
-        log(f'評価 {name}: {meta["n_tokens"]} トークン '
-            f'hash={meta["token_hash"][:12]}')
+    evaluation_sets = {}
+    if not args.no_ppl:
+        evaluation_sets = {
+            name: load_evaluation(name, args.model, args.seqlen) for name in datasets}
+        for name, token_set in evaluation_sets.items():
+            meta = token_set.metadata()
+            log(f'評価 {name}: {meta["n_tokens"]} トークン '
+                f'hash={meta["token_hash"][:12]}')
 
     payload = {
         'arguments': vars(args),
@@ -203,36 +321,40 @@ def command_run(args):
     records = []
     failures = []
     for seed in seeds:
-        for alloc_spec, router_name in configs:
+        for alloc_spec in allocs:
             log()
-            log(f'== seed {seed} / {alloc_spec} + {router_name} ==')
+            log(f'== seed {seed} / {alloc_spec} / {",".join(routers)} ==')
             try:
                 run_payload, results = run_one(
-                    args, alloc_spec, router_name, seed, evaluation_sets)
+                    args, alloc_spec, routers, seed, evaluation_sets)
             except Exception as error:  # 1構成の失敗で残りを捨てない
                 log(f'  失敗: {type(error).__name__}: {error}')
                 # 落ちた場所まで残す。ミラーが唯一の記録になることがある
                 log(traceback.format_exc())
                 failures.append(
-                    {'seed': seed, 'allocation': alloc_spec,
-                     'router': router_name, 'error': f'{type(error).__name__}: {error}'})
+                    {'seed': seed, 'allocation': alloc_spec, 'routers': routers,
+                     'error': f'{type(error).__name__}: {error}'})
                 payload['failures'] = failures
                 runlog.write_json(os.path.join(out, JSON_NAME), payload)
                 gc.collect()
                 torch.cuda.empty_cache()
                 continue
-            records.append({'config': (alloc_spec, router_name), 'seed': seed,
-                            'ppl': results})
             payload['runs'].append(run_payload)
-            payload['summary'] = summarize(
-                records, configs, datasets, args.bootstrap_reps)
+            for router in routers:
+                if router in results:
+                    records.append({'config': (alloc_spec, router), 'seed': seed,
+                                    'ppl': results[router]})
+            if records:
+                payload['summary'] = summarize(
+                    records, configs, datasets, args.bootstrap_reps,
+                    args.bootstrap_seed)
             runlog.write_json(os.path.join(out, JSON_NAME), payload)
 
     log()
     log('== まとめ (平均 PPL、小さいほど良い) ==')
     for row in payload.get('summary', {}).get('configurations', []):
         for dataset, entry in row['datasets'].items():
-            line = (f'{row["allocation"]:>10} + {row["router"]:<16} '
+            line = (f'{row["allocation"]:>10} + {row["router"]:<20} '
                     f'{dataset:<10} {entry["mean_ppl"]:.6f}')
             paired = entry.get('paired_vs_baseline')
             if paired:

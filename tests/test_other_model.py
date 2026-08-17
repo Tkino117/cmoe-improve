@@ -40,7 +40,7 @@ def token_set(name, shape, seed=0):
 
 def test_qwen2_converts_through_the_same_path(qwen_adapter):
     converter = Converter(
-        qwen_adapter, create_carver('cmoe', N_EXPERTS), create_method('cmoe'),
+        qwen_adapter, create_carver('cmoe', N_EXPERTS), [create_method('cmoe')],
         n_experts=N_EXPERTS)
     allocation = Allocation((1, 3), name='mixed', n_active_total=N_ACTIVE)
     report = converter.convert(token_set('calib', (2, SEQLEN)), allocation)

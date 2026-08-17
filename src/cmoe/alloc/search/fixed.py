@@ -8,6 +8,8 @@
 同じ組み立て役で表せる理由である。
 """
 
+import re
+
 from cmoe.alloc.base import Allocation
 from cmoe.alloc.presets import N_ACTIVE, PRESETS
 
@@ -46,14 +48,25 @@ class FixedSearch:
                           n_active_total=self.n_active_total).check_layers(n_layers)
 
 
+UNIFORM = re.compile(r'^uniform(\d+)$')
+
+
 def parse_allocation(spec, n_active_total=N_ACTIVE):
-    """--alloc を解決する。プリセット名か、カンマ区切りの値の並び。"""
+    """--alloc を解決する。
+
+    受け付けるのは3種類 — ``uniform<x>``、プリセット名、カンマ区切りの値の並び。
+    ``uniform<x>`` だけは層数に依存しないので、その場で組む。
+    """
+    uniform = UNIFORM.match(spec)
+    if uniform:
+        return UniformSearch(int(uniform.group(1)), n_active_total)
     if spec in PRESETS:
         return FixedSearch.from_preset(spec, n_active_total)
     fields = [field.strip() for field in spec.split(',') if field.strip()]
     if len(fields) < 2:
         raise ValueError(
-            f'未知の配分 {spec!r}。{sorted(PRESETS)} か、層数分のカンマ区切りの値')
+            f'未知の配分 {spec!r}。uniform<x> か {sorted(PRESETS)} か、'
+            '層数分のカンマ区切りの値')
     try:
         values = [int(field) for field in fields]
     except ValueError:

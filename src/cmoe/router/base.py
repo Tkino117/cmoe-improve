@@ -83,7 +83,10 @@ def build_baseline_router(dense, partition, topk, bias_speed=0.001,
     else:
         router.classifier.weight.data = core_up
         router.gate.weight.data = core_gate
-    return router
+    # gate と classifier の行は dense の重みから来るので層と同じデバイスにある。
+    # ゼロで作った extra_scale / extra_bias だけが取り残されるので、ここで揃える。
+    # 層に載せる前に走る診断も、この時点で動ける必要がある。
+    return router.to(core_up.device)
 
 
 _UNSET = object()

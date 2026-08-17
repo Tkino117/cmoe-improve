@@ -54,6 +54,30 @@ class TokenSet:
         }
 
 
+@dataclass(frozen=True)
+class Splits:
+    """ルーターを作るのに要る3本のトークン列。
+
+    carve:      分割と expert 重みを決める（既存の測定はすべて 8 系列）
+    fit:        ルーター方式が代表を選ぶのに使う。carve と重ならない
+    validation: 出来たルーターを診断するのに使う。訓練 split ですらない
+
+    3本を分けるのは、代表を選んだデータでその代表を評価すると必ず良く見える
+    ためである。carve と fit が重ならないことは引き方の側で保証する。
+    """
+
+    carve: TokenSet
+    fit: TokenSet
+    validation: TokenSet
+
+    def metadata(self):
+        return {
+            'carve': self.carve.metadata(),
+            'fit': self.fit.metadata(),
+            'validation': self.validation.metadata(),
+        }
+
+
 def load_tokenizer(model):
     from transformers import AutoTokenizer
 
