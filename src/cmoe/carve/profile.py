@@ -35,6 +35,27 @@ def analyze_activations(scores, k_act=10):
 
 
 @torch.no_grad()
+def profile_layer(dense, z, k_act=10, normalize=True, batch_chunk=None,
+                  device=None):
+    """FFN 入力 z から (rates, markers) を作る。バッチを分けても結果は同じ。
+
+    組み立て役と配分オラクルが同じ統計を見るための1本。分割規則は統計から
+    決まるので、ここが2実装あると「探索が測った分割」と「変換が載せた分割」が
+    別物になりうる。
+    """
+    step = batch_chunk or z.shape[0]
+    rows = []
+    for start in range(0, z.shape[0], step):
+        chunk = z[start:start + step].to(device) if device is not None else z[start:start + step]
+        h = hidden_activations(dense, chunk, normalize=normalize)
+        rows.append(h.to('cpu'))
+        del h, chunk
+    h = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
+    _, rates, markers = analyze_activations(h, k_act=k_act)
+    return rates, markers
+
+
+@torch.no_grad()
 def hidden_activations(dense, z, normalize=True):
     """FFN 入力 z から中間活性 h を作る。
 

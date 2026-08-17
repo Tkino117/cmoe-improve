@@ -1,13 +1,23 @@
-"""唯一のドライバ。
+"""唯一のドライバ。コマンドは2つ。
 
-配分とルーターをそれぞれ複数指定できる。両方に複数を渡せばその直積が走るので、
-report/13 の 2×2 表（一様 x=3 / ビーム配分 × 現行ルーター / 方式4）は
-1コマンドで出る。
+``run`` は決まった配分でモデルを変換し、perplexity を測る。配分とルーターを
+それぞれ複数指定でき、両方に複数を渡せばその直積が走るので、report/13 の 2×2 表
+（一様 x=3 / ビーム配分 × 現行ルーター / 方式4）は1コマンドで出る。
 
   cmoe run --alloc uniform3,beam --router cmoe,oracle_recovery --seeds 0,1,2
 
 同じ配分のルーター違いは**1回の変換**でまかなう。carve も expert 重みも共有し、
 ``MoE.gate`` だけを差し替えて評価するので、比較が「ルーターだけの差」になる。
+
+``search`` は配分そのものを探す。採点オラクルと探索アルゴリズムを別々に選べる
+ので、「同じ目的関数で探索を替える」「同じ探索で安いオラクルに替える」がどちらも
+1行の違いになる。
+
+  cmoe search --oracle suffix_kl --search beam --width 4
+
+出てくるのは層ごとの x のベクトルで、そのまま ``run --alloc`` に貼れる。探索と
+評価を分けてあるのは、探索が数時間かかる一方で、出た配分を使う実験はその後
+何度も走るからである。
 
 方式の分岐はここに無い。名前は各軸の registry が解決する。
 """
@@ -22,8 +32,12 @@ import torch
 
 from cmoe import runlog
 from cmoe.adapters.registry import create_adapter, guess_adapter
+from cmoe.alloc.oracles.base import LayerWalk, score_allocation
+from cmoe.alloc.oracles.registry import check_oracle, create_oracle
+from cmoe.alloc.search.beam import BudgetExceeded
 from cmoe.alloc.search.fixed import parse_allocation
-from cmoe.assemble import Converter, install_routers
+from cmoe.alloc.search.registry import check_search, create_search
+from cmoe.assemble import Converter, install_routers, layer_factory
 from cmoe.carve.registry import create_carver
 from cmoe.data.registry import load_calibration, load_evaluation, load_splits
 from cmoe.eval.ppl import evaluate_ppl
@@ -32,6 +46,7 @@ from cmoe.router.diagnostics import gap_recovered
 from cmoe.router.registry import create_method, resolve_chain
 
 TEXT_NAME, JSON_NAME = 'run.txt', 'summary.json'
+SEARCH_JSON = 'search.json'
 log = runlog.log
 
 
@@ -93,6 +108,40 @@ def build_parser():
     run.add_argument('--bootstrap-reps', type=int, default=10000)
     run.add_argument('--bootstrap-seed', type=int, default=20260813)
     run.add_argument('--out', default=None)
+
+    search = sub.add_parser('search', help='層ごとの x を探す')
+    search.add_argument('--model', default='meta-llama/Llama-2-7b-hf')
+    search.add_argument('--adapter', default=None, help='省略時はモデル名から推測する')
+    search.add_argument('--oracle', default='suffix_kl',
+                        help='採点オラクル。安い順に mass / local_error / suffix_kl')
+    search.add_argument('--search', default='beam', help='探索アルゴリズム')
+    search.add_argument('--width', type=int, default=None,
+                        help='各層で生き残る接頭辞の本数。省略時は探索ごとの既定'
+                             '（beam は4、greedy は1）')
+    search.add_argument('--budget', type=float, default=None,
+                        help='オラクルのコスト上限。単位はオラクルが決める')
+    search.add_argument('--carver', default='cmoe', help='分割方式')
+    search.add_argument('--calib', default='wikitext2', help='キャリブレーションセット')
+    search.add_argument('--seed', type=int, default=0)
+    search.add_argument('--nsamples', type=int, default=8,
+                        help='キャリブレーション系列数。探索の全コストがこれに比例する')
+    search.add_argument('--nexperts', type=int, default=8)
+    search.add_argument('--nactive', type=int, default=6,
+                        help='1トークンあたりに走る expert 数 A。全候補で同じ')
+    search.add_argument('--k-act', type=int, default=10)
+    search.add_argument('--bias-speed', type=float, default=0.001)
+    search.add_argument('--seqlen', type=int, default=2048)
+    search.add_argument('--batch-chunk', type=int, default=None,
+                        help='系列を分ける幅。n が大きいときだけ要る')
+    search.add_argument('--token-chunk', type=int, default=None,
+                        help='オラクルがトークンを分ける幅')
+    search.add_argument('--no-profiling-norm', action='store_true')
+    search.add_argument('--no-router-norm', action='store_true')
+    search.add_argument('--layers', type=int, default=None,
+                        help='先頭 N 層だけ探索する（配線確認用）')
+    search.add_argument('--no-recheck', action='store_true',
+                        help='勝った配分を頭から測り直さない')
+    search.add_argument('--out', default=None)
     return parser
 
 
@@ -368,10 +417,172 @@ def command_run(args):
     return 1 if failures else 0
 
 
+def build_walk(args, adapter, calibration):
+    """探索が使う層まわしを組む。
+
+    層に載る MoE を作る役だけは組み立て役から借りる（``layer_factory``）。
+    オラクルは分割規則もルーター方式も知らないまま、候補の層を測れる。
+    """
+    inputs = adapter.capture_layer_inputs(calibration.input_ids)
+    factory = layer_factory(
+        create_carver(args.carver, args.nexperts), args.nexperts,
+        bias_speed=args.bias_speed, router_norm=not args.no_router_norm,
+        device=adapter.device)
+    return LayerWalk(
+        adapter, inputs, factory, args.nexperts,
+        n_active_total=args.nactive, k_act=args.k_act,
+        profiling_norm=not args.no_profiling_norm, batch_chunk=args.batch_chunk)
+
+
+def check_search_arguments(args):
+    """モデルを読み込む前に、引数だけで分かる誤りを出し切る。
+
+    7B を読み終えてから引数の綴り違いで落ちると、十数分がそのために消える。
+    runlog が「終わった結果がある場所」を先に拒むのと同じ理由で、断れるものは
+    測る前に断る。
+    """
+    check_oracle(args.oracle)
+    check_search(args.search, args.width)
+    if args.layers is not None and args.layers < 1:
+        # `args.layers or n_layers` は 0 を falsy として全層に化かす。配線確認の
+        # つもりの --layers 0 で本番が始まる
+        raise SystemExit(f'--layers は 1 以上（{args.layers}）')
+    if args.nactive >= args.nexperts and args.oracle != 'suffix_kl':
+        raise SystemExit(
+            f'A={args.nactive} は N={args.nexperts} 以上。どの候補も routed を'
+            f'全部走らせるので、{args.oracle} は全候補で 0 を返し、何も測らない')
+
+
+def command_search(args):
+    check_search_arguments(args)
+
+    out = args.out or runlog.default_out_dir(f'search_{args.search}')
+    runlog.prepare_out_dir(out, SEARCH_JSON)
+    runlog.open_mirror(os.path.join(out, TEXT_NAME))
+    json_path = os.path.join(out, SEARCH_JSON)
+
+    adapter_name = args.adapter or guess_adapter(args.model)
+    log(f'model={args.model} carve={args.calib} n={args.nsamples} seed={args.seed} '
+        f'N={args.nexperts} A={args.nactive}')
+    log(f'探索 {args.search}(幅 {args.width or "既定"}) × オラクル {args.oracle}')
+    log(f'出力 {out}')
+
+    adapter = create_adapter(adapter_name, args.model, seqlen=args.seqlen)
+    calibration = load_calibration(
+        args.calib, args.model, args.seqlen, args.nsamples, args.seed)
+    log(f'  carve: {calibration.name} {tuple(calibration.input_ids.shape)} '
+        f'hash={calibration.metadata()["token_hash"][:12]}')
+
+    walk = build_walk(args, adapter, calibration)
+    oracle = create_oracle(args.oracle, walk)
+    if args.token_chunk is not None and hasattr(oracle, 'token_chunk'):
+        oracle.token_chunk = args.token_chunk
+
+    n_layers = min(args.layers or adapter.n_layers, adapter.n_layers)
+    partial = n_layers != adapter.n_layers
+    if partial:
+        log(f'層 0..{n_layers - 1} だけを探索する。出てくるのは接頭辞で、'
+            'そのままでは変換に使えない')
+
+    payload = {
+        'arguments': vars(args),
+        'model': args.model,
+        'n_layers': n_layers,
+        'oracle': {'name': oracle.name, 'cost_unit': oracle.cost_unit},
+        'search': {'name': args.search, 'width': args.width,
+                   'budget': args.budget},
+        'calibration': calibration.metadata(),
+        'layers': [],
+    }
+    # 床は最後の測り直しの合否を決めるので、それを持つオラクルでは必ず測る。
+    # 読み出し1回ぶんで、探索本体に比べれば無視できる
+    floor = None
+    if hasattr(oracle, 'nondeterminism_floor'):
+        floor = oracle.nondeterminism_floor()
+        payload['nondeterminism'] = floor
+        log(f'dense 読み出しを2回: KL {floor:.3e}（この機械の非決定性の床。'
+            'これより小さい差は区別できない）')
+    runlog.write_json(json_path, payload)
+
+    def on_layer(records):
+        payload['layers'] = records
+        runlog.write_json(json_path, payload)
+
+    search = create_search(args.search, width=args.width,
+                           n_active_total=args.nactive, budget=args.budget,
+                           log=log, on_layer=on_layer)
+    log()
+    started = time.time()
+    try:
+        allocation = search.search(oracle, n_layers)
+    except BudgetExceeded as error:
+        # 予算切れは失敗ではなく結果である。決まったところまでを残す
+        log(f'予算切れ: {error}')
+        payload['budget_exceeded'] = {
+            'prefix': list(error.prefix), 'spent': error.spent,
+            'budget': error.budget}
+        runlog.write_json(json_path, payload)
+        runlog.close_mirror()
+        return 1
+    seconds = time.time() - started
+
+    best_score = search.records[-1]['beam'][0]['score']
+    payload.update({
+        'allocation': allocation.metadata(),
+        'score': best_score,
+        'spent': oracle.spent,
+        'calls': oracle.calls,
+        'seconds': seconds,
+    })
+    log()
+    log(f'{allocation.name}: score {best_score:.6e}  平均 x={allocation.mean_x:.2f}  '
+        f'コスト {oracle.spent:g} {oracle.cost_unit}（{oracle.calls} 回）')
+    if partial:
+        log(f'接頭辞 {alloc_flag(allocation)}（{n_layers}/{adapter.n_layers} 層。'
+            'run --alloc は全層ぶんを要求するので、これは貼るためのものではない）')
+    else:
+        log(f'配分: --alloc {alloc_flag(allocation)}')
+    runlog.write_json(json_path, payload)
+
+    if not args.no_recheck:
+        # 探索が勝者に付けたスコアは、系譜をたどって組み立てた数である。同じ配分を
+        # 頭から測り直すと、その帳簿が正しかったかが分かる（伝播も採点も同じ関数を
+        # 通るので、一致するはずである）
+        log()
+        log('勝った配分を頭から測り直す ...')
+        result = score_allocation(oracle, allocation)
+        gap = abs(result.score - best_score)
+        # 床があるならそれと比べて合否を言う。合否を言わない検査は、数時間の
+        # ログの中で誰も読まない1行になる
+        above = None if floor is None else gap > floor
+        log(f'  {result.score:.6e} / 探索の {best_score:.6e}  差 {gap:.3e}'
+            + ('' if floor is None else f'（床 {floor:.3e}）'))
+        if above:
+            # 例外にはしない。表はもうディスクにあり、traceback で終わる実行は
+            # 警告ごと結果を捨てられる
+            log('  WARNING: 探索と測り直しが、この機械の非決定性の床を超えて'
+                '食い違っている。表のスコアはそれが名指すモデルの数ではない — '
+                '配分を使う前に読むこと')
+        payload['recheck'] = {'score': result.score, 'gap': gap,
+                              'above_floor': above,
+                              'per_layer': result.details['per_layer']}
+        runlog.write_json(json_path, payload)
+
+    log(f'{seconds / 60:.1f} 分')
+    runlog.close_mirror()
+    return 0
+
+
+def alloc_flag(allocation):
+    return ','.join(str(x) for x in allocation)
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.command == 'run':
         return command_run(args)
+    if args.command == 'search':
+        return command_search(args)
     raise SystemExit(f'未知のコマンド {args.command!r}')
 
 

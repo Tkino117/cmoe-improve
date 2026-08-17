@@ -20,9 +20,19 @@ uv run cmoe run --alloc uniform3,beam --router cmoe,oracle_recovery --seeds 0,1,
 # ルーターの診断だけ（回収率・Oracle 一致率）
 uv run cmoe run --router oracle_recovery --diagnostics --no-ppl
 
+# 層ごとの x を探す。出た配分はそのまま run --alloc に貼れる
+uv run cmoe search --oracle suffix_kl --search beam --width 4
+
+# 安い層ローカル指標で探す（後続の層を走らせない）
+uv run cmoe search --oracle local_error --search greedy --width 1
+
 # 移送が既存の測定と同じ数字を出すかの確認
 uv run python experiments/00_anchor.py
 ```
+
+探索は採点オラクルと探索アルゴリズムを別々に選ぶ。「同じ目的関数で探索を替える」
+「同じ探索で安いオラクルに替える」がどちらも1行の違いになり、それが
+「計算量を落とす探索」の実験点になる。
 
 結果は `result_logs/<name>/` に入る（`run.txt` = 表示したものすべて、
 `summary.json` = 全精度の数値とトークンのハッシュ）。終わった結果がある
@@ -40,7 +50,7 @@ src/cmoe/
   alloc/      [軸5] SA 配分。search（探索）と oracles（採点）に分かれる
   eval/       [軸6] PPL と対応のある比較の統計
   assemble.py 組み立て役。軸どうしを繋ぐ知識はここにしか無い
-  cli.py      唯一のドライバ
+  cli.py      唯一のドライバ（run = 変換して測る / search = 配分を探す）
 experiments/  1実験1ファイルの薄い設定
 tests/        CPU で数秒で回る動作確認
 ```
@@ -51,14 +61,18 @@ tests/        CPU で数秒で回る動作確認
 
 ## 状態
 
-移送済み: 軸1〜4 と6 の全体、軸5 の適用側（配分ベクトルをモデルに反映する経路）。
+6つの軸すべてが移送済み。
 
 - アダプタ: `llama`（既存の測定を再現する経路）、`auto`（同じ層構造の他モデル）
 - ルーター方式: 現行 CMoE、頻度重心、Oracle 相関、回収率の共同最適化、
   expert 平均（素/centered）、診断用 `|h|` オラクル
 - ルーター診断: `|h|` 回収率、Oracle gap 回収率、Top-K の recall と完全一致率
+- 採点オラクル: `mass`（活性質量の回収率）、`mass_squared`、`local_error`（層の
+  出力誤差 L）、`suffix_kl`（残りを dense のまま走らせた出力分布の KL）
+- 配分の探索: `beam`（幅を指定）、`greedy`（幅1のビームそのもの）
 
-未移送: 配分の探索アルゴリズム（beam / greedy）と採点オラクル。既知の配分は
-`src/cmoe/alloc/presets.py` に定数として置いてある。
+探索を走らせずに使う既知の配分は `src/cmoe/alloc/presets.py` に定数として
+置いてある。探索の再実装が同じベクトルを出すことは求めていない（浮動小数の
+順序ひとつで分岐が変わる）。
 
 元実装と過去のレポートは `CMoE-ref/`（追跡対象外）にある。

@@ -26,9 +26,10 @@ import time
 import torch
 import torch.nn as nn
 
+from cmoe.alloc.oracles.base import CarvedLayer
 from cmoe.carve.base import build_experts
-from cmoe.carve.profile import analyze_activations, hidden_activations
-from cmoe.moe.modules import MoE
+from cmoe.carve.profile import profile_layer
+from cmoe.moe.modules import MoE, forward_chunked
 from cmoe.router.base import (build_baseline_router, build_router, make_context,
                               router_representative_indices)
 from cmoe.router.diagnostics import evaluate_routers_against_abs_oracle
@@ -101,6 +102,36 @@ def build_moe(dense, partition, topk, router, n_experts):
     moe.shared_experts = experts[0]
     moe.cus_training = False
     return moe
+
+
+def layer_factory(carver, n_experts, bias_speed=0.001, router_norm=True,
+                  device=None):
+    """配分オラクルへ渡す「x → その層に載る MoE」。
+
+    配分の探索は、候補 x の層が実際にどう振る舞うかを見なければ採点できないが、
+    分割規則もルーター方式もその関心事ではない。ここで包んで渡すことで、
+    ``alloc`` が ``router`` を import せずに済む — 軸4 と軸5 を同時に使う知識は、
+    組み立て役だけが持つ。
+
+    層に載せるのと同じ経路（``build_baseline_router`` → ``build_moe``）を通る。
+    探索が測った層と、あとで ``Converter`` が載せる層が別物にならないための
+    取り決めである。
+    """
+    @torch.no_grad()
+    def build(dense, rates, markers, n_shared, topk):
+        partition = carver.carve(dense, rates, markers, n_shared)
+        router = build_baseline_router(dense, partition, topk,
+                                       bias_speed=bias_speed,
+                                       normalize=router_norm)
+        moe = build_moe(dense, partition, topk, router, n_experts)
+        # expert とルーターの行は dense の重みから来るので既に層と同じデバイスに
+        # ある。ゼロで作った extra_scale / extra_bias だけが取り残される
+        if device is not None:
+            moe.to(device)
+        return CarvedLayer(n_shared=n_shared, topk=topk, moe=moe,
+                           partition=partition)
+
+    return build
 
 
 def install_routers(adapter, routers):
@@ -321,26 +352,12 @@ class Converter:
     @torch.no_grad()
     def _profile(self, dense, z):
         """FFN 入力から活性統計を作る。バッチを分けても結果は同じ。"""
-        step = self.batch_chunk or z.shape[0]
-        rows = []
-        for start in range(0, z.shape[0], step):
-            chunk = z[start:start + step].to(self.adapter.device)
-            h = hidden_activations(dense, chunk, normalize=self.profiling_norm)
-            rows.append(h.to('cpu'))
-            del h, chunk
-        h = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
-        _, rates, markers = analyze_activations(h, k_act=self.k_act)
-        return rates, markers
+        return profile_layer(dense, z, k_act=self.k_act,
+                             normalize=self.profiling_norm,
+                             batch_chunk=self.batch_chunk,
+                             device=self.adapter.device)
 
     @torch.no_grad()
     def _forward_moe(self, moe, z, residual, batch_chunk):
-        step = batch_chunk or z.shape[0]
-        if step >= z.shape[0]:
-            return moe(z) + residual
-        output = torch.empty_like(z, device=z.device)
-        for start in range(0, z.shape[0], step):
-            stop = min(start + step, z.shape[0])
-            value = (moe(z[start:stop].to(self.adapter.device))
-                     + residual[start:stop].to(self.adapter.device))
-            output[start:stop].copy_(value.to(z.device))
-        return output
+        return forward_chunked(moe, z, residual, batch_chunk=batch_chunk,
+                               device=self.adapter.device)

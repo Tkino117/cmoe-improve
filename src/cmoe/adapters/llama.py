@@ -12,17 +12,10 @@ transformers を 4.47.1 に固定しているのは、層を ``position_embeddin
 import torch
 import torch.nn as nn
 
-from cmoe.adapters.base import DenseFFN, LayerInputs
+from cmoe.adapters.base import DenseFFN, LayerInputs, slice_batch
 from cmoe.moe.modules import MoE
 
 DEFAULT_SEQLEN = 2048
-
-
-def _slice_batch(value, start, stop, batch_size):
-    """バッチ次元を持つものだけを切る。mask/position_ids は共有のことがある。"""
-    if isinstance(value, torch.Tensor) and value.dim() and value.shape[0] == batch_size:
-        return value[start:stop]
-    return value
 
 
 class LlamaAdapter:
@@ -137,8 +130,8 @@ class LlamaAdapter:
             states = layer.input_layernorm(residual)
             states = layer.self_attn(
                 hidden_states=states,
-                attention_mask=_slice_batch(attention_mask, start, stop, batch_size),
-                position_ids=_slice_batch(position_ids, start, stop, batch_size),
+                attention_mask=slice_batch(attention_mask, start, stop, batch_size),
+                position_ids=slice_batch(position_ids, start, stop, batch_size),
             )[0]
             residual = residual + states
             z = layer.post_attention_layernorm(residual)
@@ -150,6 +143,36 @@ class LlamaAdapter:
     def forward_layer(self, index, hidden, attention_mask, position_ids):
         return self.layers[index](
             hidden, attention_mask=attention_mask, position_ids=position_ids)[0]
+
+    @torch.no_grad()
+    def forward_suffix(self, start_layer, hidden, inputs, batch_chunk=None):
+        """層 ``start_layer`` 以降を走らせて logits にする。
+
+        start_layer が層数と等しければ空の suffix で、最終 norm と lm_head だけが
+        走る。最終層まで変換した接頭辞にはこれが要るので、呼ぶ側の分岐にしない。
+
+        hidden は読むだけで書き換えない（層はどれも新しいテンソルを返す）ので、
+        呼ぶ側の状態は次の候補にそのまま使える。
+        """
+        if not 0 <= start_layer <= self.n_layers:
+            raise ValueError(
+                f'start_layer={start_layer} は 0..{self.n_layers} の外')
+        if hidden.dim() != 3:
+            raise ValueError(f'[bsz, seq, hidden] のはず（{tuple(hidden.shape)}）')
+
+        batch_size = hidden.shape[0]
+        step = batch_chunk or batch_size
+        chunks = []
+        for start in range(0, batch_size, step):
+            stop = min(start + step, batch_size)
+            states = hidden[start:stop].to(self.device)
+            mask = slice_batch(inputs.attention_mask, start, stop, batch_size)
+            positions = slice_batch(inputs.position_ids, start, stop, batch_size)
+            for index in range(start_layer, self.n_layers):
+                states = self.forward_layer(index, states, mask, positions)
+            chunks.append(self.head(states))
+            del states
+        return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
     @torch.no_grad()
     def head(self, hidden):

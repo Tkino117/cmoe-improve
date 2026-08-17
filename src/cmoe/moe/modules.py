@@ -114,3 +114,26 @@ class MoE(nn.Module):
                 y[idx] += expert(x[idx])
         z = self.shared_experts(x)
         return (y + z).view(shape)
+
+
+@torch.no_grad()
+def forward_chunked(moe, z, residual, batch_chunk=None, device=None):
+    """変換後の層の出力 ``moe(z) + residual`` を、バッチを分けて作る。
+
+    層を丸ごと呼ばずにここで足しているのは、attention 側をすでに進めてあるから
+    である（``ModelAdapter.forward_attention``）。組み立て役も配分オラクルも
+    次の層への入力をこの1本で作る — 伝播が2実装あれば、探索が測った軌道と
+    変換が載せた軌道が黙って分かれる。
+
+    戻り値は z と同じデバイス。``batch_chunk`` を指定したときだけ分割して進める
+    （各系列は独立に流れるので、分けても数値は変わらない）。
+    """
+    step = batch_chunk or z.shape[0]
+    if step >= z.shape[0]:
+        return moe(z) + residual
+    output = torch.empty_like(z, device=z.device)
+    for start in range(0, z.shape[0], step):
+        stop = min(start + step, z.shape[0])
+        value = moe(z[start:stop].to(device)) + residual[start:stop].to(device)
+        output[start:stop].copy_(value.to(z.device))
+    return output

@@ -13,6 +13,17 @@
 
 探索を足すのとオラクルを足すのが独立なので、「計算量を落とす探索」の比較が
 同じ土俵でできる。
+
+オラクルの契約は2つある。``ScoreOracle`` は配分ベクトル1本を丸ごと採点する
+（実 PPL のように、全層が決まって初めて意味を持つ指標がこれ）。実際に走る探索
+— greedy も beam も — が要求するのはもう一方の ``PrefixOracle`` で、層0 から
+順に「ここまでの接頭辞に x を足したら」を採点する。前から進める探索が接頭辞を
+毎回ゼロから測り直さずに済むのは、この形だけである。
+
+接頭辞の**状態**（そこまでの層が次の層へ渡す隠れ状態）は探索から見て不透明で
+ある。探索が持つのは「どの状態から x を足したか」という系譜だけで、状態の中身
+を読まない。これは節約のためではなく境界の位置の問題で、beam の枝刈り規則は
+GPU も 13GB のモデルも無しに検査できるところに置く。
 """
 
 from dataclasses import dataclass, field
@@ -97,10 +108,42 @@ class ScoreOracle(Protocol):
         """これまでに使った総コスト。"""
 
 
+class PrefixOracle(Protocol):
+    """層0 から順に、接頭辞へ1層足したものを採点する。
+
+    ``extend`` が返すスコアは**その接頭辞全体**のスコアであって、足した1層の
+    ぶんではない。層をまたいでどう積むか（層ローカル誤差なら足し合わせ、suffix
+    KL なら測り直し）は指標ごとに違い、探索がそれを知る必要はないからである。
+    同じ層で比べられる限り、探索は大小しか見ない。
+
+    ``state`` は不透明な接頭辞の状態。作るのも捨てるのもオラクルで、探索は
+    受け取った物をそのまま持ち回り、要らなくなったら ``release`` に返す。
+    """
+
+    name: str
+    cost_unit: str
+
+    def candidates(self, layer: int) -> tuple:
+        """その層で試せる x。"""
+
+    def root(self) -> object:
+        """何も決めていない接頭辞の状態（= キャリブレーション入力）。"""
+
+    def extend(self, state, layer: int, x: int) -> tuple:
+        """(ScoreResult, 新しい状態)。スコアは小さいほど良い。"""
+
+    def release(self, state) -> None:
+        """この状態はもう読まれない、と伝える。"""
+
+    @property
+    def spent(self) -> float:
+        """これまでに使った総コスト。"""
+
+
 class AllocationSearch(Protocol):
     """配分を決める。オラクルの中身は知らない。"""
 
     name: str
 
-    def search(self, oracle: ScoreOracle, n_layers: int) -> Allocation:
+    def search(self, oracle: PrefixOracle, n_layers: int) -> Allocation:
         ...

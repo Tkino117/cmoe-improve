@@ -17,6 +17,19 @@ import torch
 import torch.nn as nn
 
 
+def slice_batch(value, start, stop, batch_size):
+    """バッチ次元を持つものだけを切る。
+
+    ``attention_mask`` は sdpa で None、eager で [bsz, 1, seq, seq]、
+    ``position_ids`` はふつう [1, seq] でバッチ方向へ broadcast される。本当に
+    バッチである先頭次元しか切ってはいけない — broadcast の側を切ると、その塊に
+    別の塊の位置を黙って渡すことになる。
+    """
+    if isinstance(value, torch.Tensor) and value.dim() and value.shape[0] == batch_size:
+        return value[start:stop]
+    return value
+
+
 @dataclass(frozen=True)
 class DenseFFN:
     """一層分の dense FFN。carve と router はこれしか見ない。
@@ -80,6 +93,13 @@ class ModelAdapter(Protocol):
 
     def forward_layer(self, index, hidden, attention_mask, position_ids):
         """層 index を丸ごと進める。"""
+
+    def forward_suffix(self, start_layer, hidden, inputs, batch_chunk=None):
+        """層 start_layer 以降を走らせて logits にする。
+
+        ``start_layer == n_layers`` は空の suffix（最終段だけ）。層の呼び出し
+        規約もバッチの切り方もモデルごとの事情なので、上位はこれ1つで済ませる。
+        """
 
     def head(self, hidden: torch.Tensor) -> torch.Tensor:
         """最終 norm と lm_head を当てて logits にする。"""
