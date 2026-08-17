@@ -263,8 +263,9 @@ def test_a_searched_allocation_can_be_pasted_into_run():
     assert parse_alloc_specs('uniform3,beam') == ['uniform3', 'beam']
     assert parse_alloc_specs('beam') == ['beam']
 
-    # 直積の側から見ても1構成にしかならない
-    args = build_parser().parse_args(
+    parser = build_parser()
+    # 直積の側から見ても、配分としては1つにしかならない
+    args = parser.parse_args(
         ['run', '--alloc', searched, '--router', 'cmoe,oracle_recovery'])
     assert configurations(args) == [(searched, 'cmoe'),
                                     (searched, 'oracle_recovery')]
@@ -272,6 +273,14 @@ def test_a_searched_allocation_can_be_pasted_into_run():
     allocation = parse_allocation(searched, n_active_total=6).search(None, 32)
     assert len(allocation) == 32
     assert allocation[0] == 3
+
+    # 名前とベクトルを並べて測るには --alloc を繰り返す。1つのカンマ区切りに
+    # 混ぜると、上の判別が働かない
+    mixed = parser.parse_args(
+        ['run', '--alloc', 'uniform3', '--alloc', searched, '--router', 'cmoe'])
+    assert configurations(mixed) == [('uniform3', 'cmoe'), (searched, 'cmoe')]
+    # argparse の append は既定値へ足してしまうので、既定は渡さずここで入れる
+    assert parse_alloc_specs(parser.parse_args(['run']).alloc) == ['uniform3']
 
 
 def test_argument_errors_surface_before_the_model_is_loaded():

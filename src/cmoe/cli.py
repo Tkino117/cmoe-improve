@@ -47,6 +47,7 @@ from cmoe.router.registry import create_method, resolve_chain
 
 TEXT_NAME, JSON_NAME = 'run.txt', 'summary.json'
 SEARCH_JSON = 'search.json'
+DEFAULT_ALLOC = 'uniform3'
 log = runlog.log
 
 
@@ -58,20 +59,36 @@ def parse_seeds(spec):
     return [int(field) for field in parse_list(spec)]
 
 
-def parse_alloc_specs(spec):
+def parse_alloc_specs(specs):
     """``--alloc`` を、直積に回す配分の並びに割る。
 
-    カンマが2つの意味を持つ — 配分の並び（``uniform3,beam``）と、層ごとの値を
-    並べた1本のベクトル（``3,6,6,...``）である。区別は「全部が数字か」で付く。
-    配分の**名前**が数字だけになることは無いので、これは曖昧にならない。
+    1つの ``--alloc`` の中でカンマが2つの意味を持つ — 配分の並び
+    （``uniform3,beam``）と、層ごとの値を並べた1本のベクトル（``3,6,6,...``）で
+    ある。区別は「全部が数字か」で付く。配分の**名前**が数字だけになることは
+    無いので、これは曖昧にならない。
 
     この判別が無いと、``search`` が「そのまま貼れる」と印字したベクトルを
     ``run`` が32個の未知の配分名として読む。探索の結果を使う経路がそこで切れる。
+
+    ``--alloc`` は繰り返せる。名前とベクトルを混ぜるにはこれしかない —
+    ``--alloc uniform3,3,6,6,...`` は1つのカンマ区切りの中で両方を名乗ることに
+    なり、上の判別が働かない。探した配分を既定と並べて測るのが、そのまま
+    ``--alloc uniform3 --alloc 3,6,6,...`` になる。
     """
-    fields = parse_list(spec)
-    if len(fields) > 1 and all(field.lstrip('-').isdigit() for field in fields):
-        return [spec]
-    return fields
+    # argparse の append は、既定値を渡すとそこへ**足す**（--alloc beam が
+    # ['uniform3', 'beam'] になる）。既定は None にしておいて、ここで入れる
+    if specs is None:
+        specs = [DEFAULT_ALLOC]
+    if isinstance(specs, str):
+        specs = [specs]
+    rows = []
+    for spec in specs:
+        fields = parse_list(spec)
+        if len(fields) > 1 and all(field.lstrip('-').isdigit() for field in fields):
+            rows.append(spec)
+            continue
+        rows.extend(fields)
+    return rows
 
 
 def build_parser():
@@ -81,8 +98,9 @@ def build_parser():
     run = sub.add_parser('run', help='変換して perplexity を測る')
     run.add_argument('--model', default='meta-llama/Llama-2-7b-hf')
     run.add_argument('--adapter', default=None, help='省略時はモデル名から推測する')
-    run.add_argument('--alloc', default='uniform3',
-                     help='配分。プリセット名か層数分のカンマ区切り。複数渡すと直積')
+    run.add_argument('--alloc', action='append', default=None,
+                     help='配分。プリセット名か層数分のカンマ区切り。'
+                          '繰り返すと直積（名前とベクトルを混ぜるにはこれ）')
     run.add_argument('--router', default='cmoe',
                      help='ルーター方式（複数可）。方式4 は先行方式を自動で前に挿す')
     run.add_argument('--carver', default='cmoe', help='分割方式')
