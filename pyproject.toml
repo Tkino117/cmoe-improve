@@ -1,7 +1,48 @@
 [project]
 name = "cmoe-improve"
 version = "0.1.0"
-description = "Add your description here"
+description = "CMoE の training-free MoE 化を続けるための実験基盤"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+# CMoE-ref と同じ 3.11 系に揃える。datasets 2.21 / transformers 4.47 の
+# 組み合わせが検証されているのがここまでのため、上限も切る。
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    # 元 README の pin は torch 2.4.1+cu124 だが、このマシンの GPU は
+    # RTX PRO 5000 Blackwell (sm_120) で cu124 ビルドにカーネルが無い。
+    "torch>=2.7,<2.9",
+    # transformers は 4.47.1 に固定する。層の self_attn を position_embeddings
+    # 無しで呼ぶため、4.48 で削除された LlamaAttention.rotary_emb
+    # フォールバックが必要。
+    "transformers==4.47.1",
+    "datasets==2.21.0",
+    "accelerate==1.2.1",
+    "sentencepiece==0.2.0",
+    "protobuf==5.29.2",
+    "lap==0.5.12",
+    "numpy<2",
+    "tqdm",
+]
+
+[project.scripts]
+cmoe = "cmoe.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cmoe"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
