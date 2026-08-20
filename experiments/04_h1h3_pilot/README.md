@@ -33,7 +33,7 @@ H1 の一様（wikitext2 で組んだもの）を H3 の対照には使えない
 | モデル | meta-llama/Llama-2-7b-hf |
 | N / A | 8 / 6（全構成で推論コストは同一） |
 | nsamples / seqlen | 8 / 2048 |
-| seed | 0（**探索用①と変換用②を揃える**。docs/03 の「同一のものを用いる」） |
+| seed | `--seed` で振る（**探索用①と変換用②を揃える**。docs/03 の「同一のものを用いる」） |
 | 採点オラクル | `suffix_kl` |
 | 探索 | beam |
 | router | cmoe |
@@ -46,10 +46,18 @@ H1 の一様（wikitext2 で組んだもの）を H3 の対照には使えない
 2層だけの `--smoke` は同じ経路を10分で全部通る。
 
 ```bash
-uv run python experiments/04_h1h3_pilot/run.py --smoke   # 2層だけの動作確認
-uv run python experiments/04_h1h3_pilot/run.py           # 本実行（約4時間）
-uv run python experiments/04_h1h3_pilot/run.py --stages h2   # 段を選ぶ
+uv run python experiments/04_h1h3_pilot/run.py --smoke        # 2層だけの動作確認
+uv run python experiments/04_h1h3_pilot/run.py                # seed 0（約4時間）
+uv run python experiments/04_h1h3_pilot/run.py --seed 1        # seed 1
+uv run python experiments/04_h1h3_pilot/run.py --stages h2     # 段を選ぶ
+
+# 複数 seed をまとめる（GPU 不要）
+uv run python experiments/04_h1h3_pilot/summarize_seeds.py --seeds 0,1,2
 ```
+
+出力先は `result_logs/h1h3_pilot`（seed 0 は添字を付けない）、
+`result_logs/h1h3_pilot_seed1` … と分かれる。まとめは
+`result_logs/h1h3_pilot_seeds/seeds.md`。
 
 `--stages` で選ばなかった段も、済んでいればディスクから読んで集約に入る
 （pilot.md から他の段が消えることはない）。
@@ -71,8 +79,9 @@ uv run python experiments/04_h1h3_pilot/run.py --stages h2   # 段を選ぶ
 `cmoe run` に途中再開は無いので、1構成でも失敗した評価は次の起動で全構成を
 引き直す（済んだぶんは `.partial<N>` に残る）。
 
-wikitext2・幅2・seed 0 の探索は report/01 が済ませてある。引数が一致することを
-確かめたうえで取り込み、出所を `reused_from.txt` に残す。
+wikitext2・幅2 の探索は report/01 が seed 0〜4 まで済ませてある。探索が見るのは①
+だけなので（②は探索に入らない）、①=② に揃えた本実験でもそのまま使える。引数の
+一致を確かめたうえで取り込み、出所を `reused_from.txt` に残す。
 
 集約は `pilot.json` / `pilot.md`（測ったコードのコミットも記録する）。各校正の
 uniform3 は2回組み直すことになるので、その2つが塊ごとの NLL まで一致するかを

@@ -1,9 +1,12 @@
 """04 H1〜H3 の下見。設計は docs/03、固定する条件は同じディレクトリの README。
 
-seed 1本（探索用①と変換用②を揃えて 0）で H1〜H3 をひととおり出す。
+seed 1本（探索用①と変換用②を揃える）で H1〜H3 をひととおり出す。seed は
+``--seed`` で振り、出力先も seed ごとに分かれる。複数 seed のまとめは
+同じディレクトリの ``summarize_seeds.py``。
 
   uv run python experiments/04_h1h3_pilot/run.py --smoke   # 2層だけの動作確認
-  uv run python experiments/04_h1h3_pilot/run.py           # 本実行（約4時間）
+  uv run python experiments/04_h1h3_pilot/run.py           # seed 0（約4時間）
+  uv run python experiments/04_h1h3_pilot/run.py --seed 1  # seed 1
 
 段（探索1本 / 評価1回）ごとに別ディレクトリへ書き、終わった段は飛ばす。途中で
 落ちても済んだ段は残り、同じコマンドで続きから走る。書きかけのディレクトリは
@@ -32,7 +35,6 @@ ROOT = Path(__file__).resolve().parents[2]
 ORACLE = 'suffix_kl'
 SEARCH = 'beam'
 ROUTER = 'cmoe'
-SEED = 0                  # ①=② 揃える
 BASELINE = 'uniform3'
 DATASETS = 'wikitext2,c4-new'
 WIDTHS = (2, 3, 4)
@@ -41,12 +43,12 @@ BOOTSTRAP_SEED = 20260813
 # 対照。先頭が run 内の対応のある比較の基準になるので uniform3 を先に置く
 UNIFORMS = [BASELINE] + [f'uniform{x}' for x in (0, 1, 2, 4, 5, 6)]
 
-# 引数が完全に一致するときだけ取り込む、既存の探索。report/01 の seed 0 は
-# ①=②=0 で、この実験の設計とそのまま重なる
-REUSE = {
-    ('wikitext2', 2):
-        ROOT / 'result_logs/calib_seed_variance_suffix_kl_w2/search_seed0',
-}
+# 引数が完全に一致するときだけ取り込む、既存の探索。report/01 は wikitext2・幅2 を
+# seed 0〜4 で済ませてある。探索が見るのは①だけなので、①=② に揃えた本実験でも
+# 探索の出力はそのまま使える（組み直しと評価はこの実験で改めて走る）
+REUSE = {('wikitext2', 2, seed):
+         ROOT / f'result_logs/calib_seed_variance_suffix_kl_w2/search_seed{seed}'
+         for seed in range(5)}
 # 結果を変えない引数（出力先・チャンク幅・測り直しの有無）。同じ実験かの判定から外す
 NOT_IDENTITY = {'out', 'batch_chunk', 'token_chunk', 'search_token_chunk',
                 'no_recheck'}
@@ -157,7 +159,8 @@ def adopt(source, out_dir, argv):
 def search_one(calib, width, out_dir, plan):
     """1本の探索。済んでいれば飛ばす。"""
     argv = ['search', '--search', SEARCH, '--width', str(width),
-            '--oracle', ORACLE, '--calib', calib, '--seed', str(SEED)]
+            '--oracle', ORACLE, '--calib', calib,
+            '--seed', str(plan['seed'])]
     if plan['layers']:
         argv += ['--layers', str(plan['layers'])]
     argv += ['--out', str(out_dir)]
@@ -169,7 +172,8 @@ def search_one(calib, width, out_dir, plan):
                else ''))
     else:
         clear(out_dir, argv, 'search.json', plan)
-        source = None if plan['dry'] else plan['reuse'].get((calib, width))
+        source = (None if plan['dry']
+                  else plan['reuse'].get((calib, width, plan['seed'])))
         record = adopt(source, out_dir, argv) if source else None
     if record is None:
         if plan['dry']:
@@ -192,7 +196,7 @@ def evaluate(out_dir, allocations, calib, plan):
     argv = ['run']
     for spec in unique:
         argv += ['--alloc', spec]
-    argv += ['--router', ROUTER, '--seeds', str(SEED), '--calib', calib,
+    argv += ['--router', ROUTER, '--seeds', str(plan['seed']), '--calib', calib,
              '--datasets', plan['datasets']]
     if plan['layers']:
         argv += ['--layers', str(plan['layers'])]
@@ -435,12 +439,14 @@ def summarize(out, stages, plan, seconds):
     datasets = plan['datasets'].split(',')
     pool, conflicts = collect(stages)
     lines = ['# 04 H1〜H3 の下見（seed 1本）', '',
-             f'探索 {SEARCH} × {ORACLE} / router {ROUTER} / seed {SEED}（①=②）/ '
+             f'探索 {SEARCH} × {ORACLE} / router {ROUTER} / '
+             f'seed {plan["seed"]}（①=②）/ '
              f'評価 {plan["datasets"]}', '',
              '対照比 NLL は、対照との塊ごとの平均 NLL の差（負なら良い）。'
              '区間は評価塊の再標本化のみで、**seed の振り直しを含まない** — '
-             'seed 間のばらつきは report/01 の標準偏差 0.0255（PPL, wikitext2）'
-             'を目安にすること。', '']
+             'seed 間のばらつきは report/01 の標準偏差 0.0255（PPL, wikitext2。'
+             'ただし①だけを振った値）を目安にすること。複数 seed を回したら '
+             'summarize_seeds.py の実測に置き換える。', '']
     titles = {'h1': 'H1 一様 x=0〜6（校正 wikitext2）',
               'h2': 'H2 wikitext2 で校正して探索',
               'h3': 'H3 c4 で校正して探索'}
@@ -530,6 +536,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--stages', default=','.join(STAGES),
                         help='走らせる段。カンマ区切り。済んでいる他の段も集約には入る')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='校正に引く8本を選ぶ seed（①=②）')
     parser.add_argument('--smoke', action='store_true',
                         help='2層・幅2・wikitext2 だけの動作確認')
     parser.add_argument('--out', default=None)
@@ -545,12 +553,16 @@ def main():
             'uniforms': UNIFORMS[:2] if args.smoke else UNIFORMS,
             'datasets': 'wikitext2' if args.smoke else DATASETS,
             'reuse': {} if args.smoke else REUSE,
+            'seed': args.seed,
             'dry': False}
+    # seed 0 の出力先は既存の実行に合わせて添字を付けない
+    stem = 'h1h3_pilot' + ('_smoke' if args.smoke else '')
+    if args.seed:
+        stem += f'_seed{args.seed}'
     out = (Path(args.out).resolve() if args.out else
-           ROOT / ('result_logs/h1h3_pilot_smoke' if args.smoke
-                   else 'result_logs/h1h3_pilot'))
+           ROOT / 'result_logs' / stem)
     out.mkdir(parents=True, exist_ok=True)
-    log(f'出力 {out} / 段 {names}' + ('（smoke: 2層だけ）' if args.smoke else ''))
+    log(f'出力 {out} / seed {args.seed} / 段 {names}' + ('（smoke: 2層だけ）' if args.smoke else ''))
 
     started = time.time()
     stages = {}
