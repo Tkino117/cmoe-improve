@@ -9,9 +9,15 @@
 配分は採点オラクル4種（mass / mass_squared / local_error / suffix_kl）と
 探索2種（beam / greedy）。
 
+選択問題ベンチマーク（`--bench`）。PIQA / WinoGrande / ARC-e / ARC-c /
+HellaSwag の 0-shot を lm-eval-harness 0.4.12 で通し、**問題ごと・選択肢ごとの
+生の対数尤度**を残す。指標は `acc` / `acc_norm` / `gold_nll` / `margin` /
+`ref_kl` / `ref_agreement` の6つで、後から GPU なしで足せる。
+
 検証: `uv run pytest tests/ -q`（CPU、数秒。オラクルは `CMoE-ref/xsearch` と
-ビット一致を確認）、`uv run python experiments/00_anchor.py`（GPU、約25分、
-既存測定と6桁一致）。
+ビット一致を確認）、`CMOE_BENCH_INTEGRATION=1 uv run pytest tests/test_bench.py -q`
+（本物の lm-eval を5タスク通す。約20秒）、`uv run python experiments/00_anchor.py`
+（GPU、約25分、既存測定と6桁一致）。
 
 探索は Llama-2-7B で実走済み（`result_logs/gputest_*`）。全32層 × `local_error`
 × beam 幅2 が 15.8 分、勝った配分の測り直しは差 0。出た配分の PPL は
@@ -24,7 +30,9 @@ wikitext2 で **6.992** に対し `uniform3` が **7.072**（対照比 NLL -0.01
 1. 計算量を落とす探索 — 安いオラクルで候補を絞り、高いオラクルで決める段構え。
    予算（`--budget`）は入れてあるので、同じ予算での比較はすぐ回せる
 2. 未測定の実験（走らせるだけ）: carve n=64 での 2×2 再測定、方式6 との組み合わせ
-3. 上の PPL 差は seed 1本・wikitext2 のみ。採否を言うには seed 3本 × c4-new が要る
+3. H4（ベンチマーク）は済んだ — [report/04](report/04_alloc-search-benchmark.md)。
+   探索配分は最良の一様配分を**どの指標でも上回らなかった**。次に決めることは
+   対照の取り方（平均 x を揃えた一様配分と比べるか）と、そこから何を主張するか
 4. `suffix_kl` の全32層はまだ走らせていない（既定の幅4 なら数時間。`presets.py`
    の `beam` はこの目的関数の産物なので、突き合わせる相手がある）
 
