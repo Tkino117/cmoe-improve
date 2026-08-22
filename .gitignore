@@ -14,3 +14,6 @@ CMoE-ref/
 
 # 一次データ（実行ごとに GB 単位で増える）
 result_logs/
+
+# ベンチのデータセットキャッシュ（datasets 2.21 で読める形で持つ）
+.cache/

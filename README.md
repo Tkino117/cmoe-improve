@@ -20,6 +20,9 @@ uv run cmoe run --alloc uniform3,beam --router cmoe,oracle_recovery --seeds 0,1,
 # ルーターの診断だけ（回収率・Oracle 一致率）
 uv run cmoe run --router oracle_recovery --diagnostics --no-ppl
 
+# 選択問題ベンチマークも測る。dense を基準に取ってから各構成を測る
+uv run cmoe run --alloc uniform4 --alloc beam --bench
+
 # 層ごとの x を探す。出た配分はそのまま run --alloc に貼れる
 uv run cmoe search --oracle suffix_kl --search beam --width 4
 
@@ -48,7 +51,7 @@ src/cmoe/
   carve/      [軸3] ニューロン分割（活性プロファイル + クラスタリング）
   router/     [軸4] ルーター方式
   alloc/      [軸5] SA 配分。search（探索）と oracles（採点）に分かれる
-  eval/       [軸6] PPL と対応のある比較の統計
+  eval/       [軸6] PPL・選択問題ベンチマークと、対応のある比較の統計
   assemble.py 組み立て役。軸どうしを繋ぐ知識はここにしか無い
   cli.py      唯一のドライバ（run = 変換して測る / search = 配分を探す）
 experiments/  1実験1ファイルの薄い設定
@@ -70,6 +73,38 @@ tests/        CPU で数秒で回る動作確認
 - 採点オラクル: `mass`（活性質量の回収率）、`mass_squared`、`local_error`（層の
   出力誤差 L）、`suffix_kl`（残りを dense のまま走らせた出力分布の KL）
 - 配分の探索: `beam`（幅を指定）、`greedy`（幅1のビームそのもの）
+- 評価: PPL と、選択問題ベンチマーク5タスク（`--bench`）
+
+### 選択問題ベンチマーク
+
+既定のタスクは PIQA / WinoGrande / ARC-e / ARC-c / HellaSwag の 0-shot で、
+CMoE 最新版（ACL 2026, arXiv:2502.04416）Table 1 と同じ並びであり、
+ExpertWeaver（arXiv:2602.15521）Table 2 との共通部分でもある。どちらの論文も
+主表の動作点はスパース率25%で、ここの N=8 / A=6 がちょうどそれに当たる。
+
+**正答率だけを見ない。** 選択問題の採点は選択肢ごとの対数尤度の argmax であり、
+正答率はマージンの**符号**しか見ない。ここで問題になる差（PPL 0.03 ≒ 1トークン
+0.004 nat）でマージンの符号をまたぐ問題はごく一部で、正答率の標本誤差に埋もれる。
+そこで残すのは集計値ではなく**問題ごと・選択肢ごとの生の対数尤度**で、指標は
+そこから後で作る（`bench_stats`）。
+
+| 指標 | 中身 | 向き |
+|---|---|---|
+| `acc` / `acc_norm` | 論文の表に載る正答率（後者は選択肢の文字数で割ってから argmax） | 大 |
+| `gold_nll` | 選択肢だけで softmax した正解確率の −log。K択分類の交差エントロピー | 小 |
+| `margin` | 正解 − 最良の不正解の対数尤度。符号が `acc` そのもの | 大 |
+| `ref_kl` | dense との、選択肢上の分布の KL。正誤と切り離して「壊した量」を見る | 小 |
+| `ref_agreement` | dense と同じ選択肢を選んだか | 大 |
+
+信頼区間は **(seed × タスク)** を層とした、問題単位の対応のある再抽出。タスクごとに
+問題数が 1,200〜10,000 と一桁違うので、層を等しく重み付けしてマクロ平均にする。
+
+生の尤度は `result_logs/<name>/bench/` に構成ごとの JSON で残る（`dense.json` が
+基準）。指標を足すのに測り直しは要らない。
+
+ベンチのデータセットは `.cache/hf-datasets` に持つ（`--bench-cache-dir`）。共有の
+HuggingFace キャッシュには新しい `datasets` が書いた索引が混じっており、このリポジトリ
+が固定している 2.21.0 では ARC と HellaSwag が読めないため。
 
 探索を走らせずに使う既知の配分は `src/cmoe/alloc/presets.py` に定数として
 置いてある。探索の再実装が同じベクトルを出すことは求めていない（浮動小数の

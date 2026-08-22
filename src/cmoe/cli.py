@@ -39,7 +39,9 @@ from cmoe.alloc.search.fixed import parse_allocation
 from cmoe.alloc.search.registry import check_search, create_search
 from cmoe.assemble import Converter, install_routers, layer_factory
 from cmoe.carve.registry import create_carver
+from cmoe.data.base import load_tokenizer
 from cmoe.data.registry import load_calibration, load_evaluation, load_splits
+from cmoe.eval import bench, bench_stats
 from cmoe.eval.ppl import evaluate_ppl
 from cmoe.eval.stats import paired_differences, stratified_paired_bootstrap
 from cmoe.router.diagnostics import gap_recovered
@@ -47,6 +49,14 @@ from cmoe.router.registry import create_method, resolve_chain
 
 TEXT_NAME, JSON_NAME = 'run.txt', 'summary.json'
 SEARCH_JSON = 'search.json'
+# 選択問題の生の尤度の置き場所。summary.json に混ぜないのは、1構成で 1MB 前後
+# あり、summary.json は1構成終わるたびに丸ごと書き直されるからである
+BENCH_DIR = 'bench'
+# ベンチのデータセットは既定の共有キャッシュを使わない。理由は
+# ``cmoe.eval.bench.datasets_cache`` にある（固定した datasets 2.21.0 では
+# 読めない索引が共有キャッシュに混じっている）。合計 100MB 弱で済む
+DEFAULT_BENCH_CACHE = os.environ.get(
+    'CMOE_BENCH_CACHE', os.path.join('.cache', 'hf-datasets'))
 DEFAULT_ALLOC = 'uniform3'
 log = runlog.log
 
@@ -139,6 +149,23 @@ def build_parser():
                      help='先頭 N 層だけ変換する（動作確認用）')
     run.add_argument('--no-ppl', action='store_true',
                      help='PPL を測らない。診断だけ見るとき')
+    run.add_argument('--bench', action='store_true',
+                     help='選択問題ベンチマークも測る')
+    run.add_argument('--bench-tasks', default=','.join(bench.DEFAULT_TASKS),
+                     help='測るタスク（既定は CMoE 最新版 Table 1 の5つ）')
+    run.add_argument('--bench-limit', type=int, default=None,
+                     help='タスクあたりの問題数を絞る（動作確認用）')
+    run.add_argument('--bench-batch-size', type=int, default=8)
+    run.add_argument('--bench-fewshot', type=int, default=0)
+    run.add_argument('--bench-cache-dir', default=DEFAULT_BENCH_CACHE,
+                     help='ベンチのデータセットのキャッシュ。共有キャッシュを'
+                          '使うには空文字を渡す')
+    run.add_argument('--bench-reference', default=None,
+                     help='測り済みの dense を基準に使う（bench/dense.json への'
+                          'パス）。dense は seed にも配分にも校正にも依らないので、'
+                          '同じモデル・同じタスクなら測り直す必要はない')
+    run.add_argument('--no-bench-dense', action='store_true',
+                     help='dense の基準を測らない。ref_kl / ref_agreement が落ちる')
     run.add_argument('--bootstrap-reps', type=int, default=10000)
     run.add_argument('--bootstrap-seed', type=int, default=20260813)
     run.add_argument('--out', default=None)
@@ -278,6 +305,30 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
                 results[name][dataset] = result
                 log(f'  {name:<20} {dataset:<10} {result.ppl:.6f}')
 
+    bench_samples = {}
+    if args.bench:
+        tokenizer = load_tokenizer(args.model)
+        for name in router_names:
+            # PPL を測らなかった経路でもルーターは載せる必要がある
+            install_routers(adapter, report.routers[name])
+            adapter.to_device()
+            started_bench = time.time()
+            bench_samples[name] = bench.evaluate_bench(
+                adapter.model, tokenizer,
+                tasks=parse_list(args.bench_tasks),
+                batch_size=args.bench_batch_size, limit=args.bench_limit,
+                num_fewshot=args.bench_fewshot, max_length=args.seqlen,
+                cache_dir=args.bench_cache_dir or None, model_name=args.model)
+            rows = bench_stats.summarize(bench_samples[name])
+            for task, values in rows['tasks'].items():
+                log(f'  {name:<20} {task:<16} acc={values["acc"]:.4f} '
+                    f'acc_norm={values["acc_norm"]:.4f} '
+                    f'gold_nll={values["gold_nll"]:.6f}')
+            log(f'  {name:<20} {"macro":<16} acc={rows["macro"]["acc"]:.4f} '
+                f'acc_norm={rows["macro"]["acc_norm"]:.4f} '
+                f'gold_nll={rows["macro"]["gold_nll"]:.6f} '
+                f'({time.time() - started_bench:.1f}s)')
+
     payload = {
         'allocation': allocation.metadata(),
         'routers': list(router_names),
@@ -294,13 +345,16 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
         'ppl': {name: {dataset: result.as_dict()
                        for dataset, result in rows.items()}
                 for name, rows in results.items()},
+        # 生の尤度は別ファイル。ここには平均だけ置く
+        'bench': {name: bench_stats.summarize(rows)
+                  for name, rows in bench_samples.items()},
         'seconds': time.time() - started,
     }
 
     del converter, adapter, report
     gc.collect()
     torch.cuda.empty_cache()
-    return payload, results
+    return payload, results, bench_samples
 
 
 def summarize_diagnostics(report):
@@ -367,6 +421,153 @@ def summarize(records, configs, datasets, reps, seed):
     return summary
 
 
+def summarize_bench(records, configs, reference, reps, seed):
+    """構成ごとの指標の平均と、先頭構成に対する対応のある差。
+
+    再抽出の層は **(seed × タスク)** である。タスクごとに問題数が 1,200〜10,000
+    と一桁違うので、層を等しく重み付けする既定の挙動がそのままマクロ平均になる
+    — まとめて1つの層にすると、平均が HellaSwag の話になる。
+    """
+    baseline_key = configs[0]
+    summary = {'baseline': f'{baseline_key[0]}+{baseline_key[1]}',
+               'reference': 'dense' if reference else None,
+               'configurations': []}
+    for config in configs:
+        mine = [record for record in records
+                if record['config'] == config and record.get('bench')]
+        if not mine:
+            continue
+        per_seed = [bench_stats.summarize(record['bench'], reference)
+                    for record in mine]
+        row = {
+            'allocation': config[0], 'router': config[1], 'n_seeds': len(mine),
+            'n_docs': per_seed[0]['n_docs'],
+            'tasks': {
+                task: {metric: sum(one['tasks'][task][metric] for one in per_seed)
+                       / len(per_seed)
+                       for metric in per_seed[0]['tasks'][task]}
+                for task in per_seed[0]['tasks']},
+            'macro': {metric: sum(one['macro'][metric] for one in per_seed)
+                      / len(per_seed)
+                      for metric in per_seed[0]['macro']},
+        }
+        if config != baseline_key:
+            row['paired_vs_baseline'] = paired_bench(
+                records, mine, baseline_key, reference,
+                list(per_seed[0]['macro']), reps, seed)
+        summary['configurations'].append(row)
+    return summary
+
+
+def paired_bench(records, mine, baseline_key, reference, metrics, reps, seed):
+    """指標ごとに、(seed × タスク) を層とした対応のある差の信頼区間。"""
+    paired = {}
+    for metric in metrics:
+        strata = []
+        for record in mine:
+            base = next((other for other in records
+                         if other['config'] == baseline_key
+                         and other['seed'] == record['seed']
+                         and other.get('bench')), None)
+            if base is None:
+                continue
+            for task, samples in record['bench'].items():
+                strata.append(bench_stats.paired_differences(
+                    base['bench'][task], samples, metric,
+                    reference=reference.get(task) if reference else None))
+        if not strata:
+            continue
+        result = stratified_paired_bootstrap(
+            strata, reps=reps, seed=seed, key='mean_difference',
+            unit='paired-question-within-seed-and-task',
+            lower_is_better=not bench_stats.HIGHER_IS_BETTER[metric])
+        # 層は seed ではなく (seed × タスク) なので、名前もそう呼ぶ
+        result['improved_strata'] = result.pop('improved_seeds')
+        result['n_strata'] = result.pop('n_seeds')
+        result['higher_is_better'] = bench_stats.HIGHER_IS_BETTER[metric]
+        paired[metric] = result
+    return paired
+
+
+def adopt_dense_bench(args, out):
+    """測り済みの dense を基準に取り込む。
+
+    dense は seed にも配分にも校正にも依らないので、同じモデル・同じタスクなら
+    測り直す意味が無い（1回 8.8分。seed 3本 × 校正2種なら 53分がそのまま消える）。
+
+    ただし「同じ問題を同じ順に測ったもの」でなければ対応のある比較にならない。
+    タスクの顔ぶれ・問題数・shot 数・limit を先に突き合わせ、食い違えば取り込ま
+    ずに止める。問題単位のずれはこの先 ``bench_stats.check_aligned`` が捕まえる。
+
+    取り込んだものは出力先にも複製する。あとから読むとき、その実行の
+    ディレクトリだけで完結していないと基準が辿れなくなる。
+    """
+    samples = bench.load_samples(args.bench_reference)
+    wanted = parse_list(args.bench_tasks)
+    if sorted(samples) != sorted(wanted):
+        raise SystemExit(
+            f'{args.bench_reference} のタスクは {sorted(samples)} で、'
+            f'いま測る {sorted(wanted)} と違う')
+    for name in wanted:
+        row = samples[name]
+        if row.model and row.model != args.model:
+            raise SystemExit(
+                f'{args.bench_reference} の {name} は {row.model} を測ったもので、'
+                f'いま測る {args.model} と違う。doc_hash は問題側のハッシュなので'
+                'そのままでは食い違いに気づけない')
+        if row.num_fewshot != args.bench_fewshot or row.limit != args.bench_limit:
+            raise SystemExit(
+                f'{args.bench_reference} の {name} は '
+                f'{row.num_fewshot}-shot / limit={row.limit} で、'
+                f'いま測る {args.bench_fewshot}-shot / limit={args.bench_limit} と違う')
+    log()
+    log(f'== dense の基準（{args.bench_reference} から取り込み）==')
+    rows = bench_stats.summarize(samples)
+    for task, values in rows['tasks'].items():
+        log(f'  {task:<16} {rows["n_docs"][task]:>6} 問  acc={values["acc"]:.4f} '
+            f'acc_norm={values["acc_norm"]:.4f} gold_nll={values["gold_nll"]:.6f}')
+    target = os.path.join(out, BENCH_DIR, 'dense.json')
+    runlog.write_json(target, {name: row.as_dict() for name, row in samples.items()})
+    with open(os.path.join(out, BENCH_DIR, 'dense_from.txt'), 'w') as handle:
+        handle.write(f'{args.bench_reference}\n')
+    return samples
+
+
+def measure_dense_bench(args, out):
+    """変換前の dense を1回だけ測る。``ref_kl`` / ``ref_agreement`` の基準。
+
+    seed にも配分にもルーターにも依らないので、実行あたり1回で足りる。基準が
+    無くても残り4指標は出るが、「どれだけ壊したか」を正誤と切り離して見る道は
+    ここでしか作れない。
+    """
+    adapter_name = args.adapter or guess_adapter(args.model)
+    adapter = create_adapter(adapter_name, args.model, seqlen=args.seqlen)
+    adapter.to_device()
+    log()
+    log('== dense の基準 ==')
+    started = time.time()
+    samples = bench.evaluate_bench(
+        adapter.model, load_tokenizer(args.model),
+        tasks=parse_list(args.bench_tasks), batch_size=args.bench_batch_size,
+        limit=args.bench_limit, num_fewshot=args.bench_fewshot,
+        max_length=args.seqlen, cache_dir=args.bench_cache_dir or None,
+        model_name=args.model)
+    rows = bench_stats.summarize(samples)
+    for task, values in rows['tasks'].items():
+        log(f'  {task:<16} {rows["n_docs"][task]:>6} 問  acc={values["acc"]:.4f} '
+            f'acc_norm={values["acc_norm"]:.4f} gold_nll={values["gold_nll"]:.6f}')
+    log(f'  {"macro":<16} {"":>6}     acc={rows["macro"]["acc"]:.4f} '
+        f'acc_norm={rows["macro"]["acc_norm"]:.4f} '
+        f'gold_nll={rows["macro"]["gold_nll"]:.6f} ({time.time() - started:.1f}s)')
+    runlog.write_json(
+        os.path.join(out, BENCH_DIR, 'dense.json'),
+        {name: row.as_dict() for name, row in samples.items()})
+    del adapter
+    gc.collect()
+    torch.cuda.empty_cache()
+    return samples
+
+
 def command_run(args):
     configs = configurations(args)
     allocs = parse_alloc_specs(args.alloc)
@@ -401,6 +602,16 @@ def command_run(args):
                      for name, token_set in evaluation_sets.items()},
         'runs': [],
     }
+    reference = None
+    if args.bench:
+        os.makedirs(os.path.join(out, BENCH_DIR), exist_ok=True)
+        log(f'ベンチ {args.bench_tasks}'
+            + (f' limit={args.bench_limit}' if args.bench_limit else '')
+            + f' {args.bench_fewshot}-shot')
+        if args.bench_reference:
+            reference = adopt_dense_bench(args, out)
+        elif not args.no_bench_dense:
+            reference = measure_dense_bench(args, out)
     records = []
     failures = []
     for seed in seeds:
@@ -408,7 +619,7 @@ def command_run(args):
             log()
             log(f'== seed {seed} / {alloc_spec} / {",".join(routers)} ==')
             try:
-                run_payload, results = run_one(
+                run_payload, results, bench_samples = run_one(
                     args, alloc_spec, routers, seed, evaluation_sets)
             except Exception as error:  # 1構成の失敗で残りを捨てない
                 log(f'  失敗: {type(error).__name__}: {error}')
@@ -422,19 +633,34 @@ def command_run(args):
                 gc.collect()
                 torch.cuda.empty_cache()
                 continue
+            index = len(payload['runs'])
             payload['runs'].append(run_payload)
+            # 生の尤度は構成ごとに1ファイル。名前に配分をそのまま使うと、探索が
+            # 出したベクトル（'3,6,6,...'）がファイル名になるので通し番号にする
+            for router, samples in bench_samples.items():
+                relative = os.path.join(BENCH_DIR, f'run{index:03d}_{router}.json')
+                runlog.write_json(
+                    os.path.join(out, relative),
+                    {name: row.as_dict() for name, row in samples.items()})
+                run_payload.setdefault('bench_samples', {})[router] = relative
             for router in routers:
-                if router in results:
+                if router in results or router in bench_samples:
                     records.append({'config': (alloc_spec, router), 'seed': seed,
-                                    'ppl': results[router]})
-            if records:
+                                    'ppl': results.get(router),
+                                    'bench': bench_samples.get(router)})
+            if any(record['ppl'] for record in records):
                 payload['summary'] = summarize(
-                    records, configs, datasets, args.bootstrap_reps,
+                    [record for record in records if record['ppl']],
+                    configs, datasets, args.bootstrap_reps, args.bootstrap_seed)
+            if any(record['bench'] for record in records):
+                payload['bench_summary'] = summarize_bench(
+                    records, configs, reference, args.bootstrap_reps,
                     args.bootstrap_seed)
             runlog.write_json(os.path.join(out, JSON_NAME), payload)
 
-    log()
-    log('== まとめ (平均 PPL、小さいほど良い) ==')
+    if 'summary' in payload:
+        log()
+        log('== まとめ (平均 PPL、小さいほど良い) ==')
     for row in payload.get('summary', {}).get('configurations', []):
         for dataset, entry in row['datasets'].items():
             line = (f'{row["allocation"]:>10} + {row["router"]:<20} '
@@ -445,6 +671,20 @@ def command_run(args):
                          f'[{paired["lower"]:+.6f}, {paired["upper"]:+.6f}] '
                          f'{paired["improved_seeds"]}/{paired["n_seeds"]} seed 改善')
             log(line)
+    if 'bench_summary' in payload:
+        log()
+        log('== ベンチマーク（マクロ平均。acc/acc_norm/margin/ref_agreement は'
+            '大きいほど、gold_nll/ref_kl は小さいほど良い）==')
+        for row in payload['bench_summary']['configurations']:
+            head = f'{row["allocation"]:>10} + {row["router"]:<20}'
+            log(head + '  ' + '  '.join(
+                f'{metric}={value:.6f}' for metric, value in row['macro'].items()))
+            for metric, paired in row.get('paired_vs_baseline', {}).items():
+                log(f'{"":>10}   {metric:<16} 対照比 '
+                    f'{paired["mean_difference"]:+.6f} '
+                    f'[{paired["lower"]:+.6f}, {paired["upper"]:+.6f}] '
+                    f'{paired["improved_strata"]}/{paired["n_strata"]} '
+                    '(seed × タスク) 改善')
     if failures:
         log(f'失敗した構成: {len(failures)}')
     runlog.close_mirror()
