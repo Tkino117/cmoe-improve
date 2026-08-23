@@ -69,6 +69,39 @@ def intervals_overlap(left, right, length):
     return left < right + length and right < left + length
 
 
+def non_overlapping_starts(total_tokens, seqlen, count, seed,
+                           max_draws=1_000_000):
+    """重ならない開始位置を count 本。
+
+    ``draw_starts`` は重なりを許す。母集団が 2.5M トークンある wikitext2 では
+    8〜16本の窓が重なることは稀（n=16 で重複トークンは 0.7%）なので実害は
+    無いが、成分ごとに必要量だけを連結する混合セットでは母集団が窓の総面積の
+    数倍しか無く、重なりが既定になってしまう。「校正データの中身の差」を見たい
+    ときに「窓の冗長度の差」が混ざるのを防ぐための引き方である。
+
+    棄却の仕方は ``disjoint_starts`` の fit と同じ。
+    """
+    if count < 1:
+        raise ValueError('本数は正のはず')
+    upper = total_tokens - seqlen - 1
+    if upper < 0:
+        raise ValueError(f'{total_tokens} トークンでは seqlen={seqlen} を切り出せない')
+
+    rng = random.Random(seed)
+    starts = []
+    draws = 0
+    while len(starts) < count and draws < max_draws:
+        start = rng.randint(0, upper)
+        draws += 1
+        if any(intervals_overlap(start, previous, seqlen) for previous in starts):
+            continue
+        starts.append(start)
+    if len(starts) != count:
+        raise ValueError(
+            f'{draws} 回引いて重ならない窓が {len(starts)}/{count} 本しか置けなかった')
+    return tuple(starts)
+
+
 def disjoint_starts(total_tokens, seqlen, carve_count, fit_count, seed,
                     max_draws=1_000_000):
     """carve の引きをそのまま残し、続けて重ならない fit を引く。

@@ -30,11 +30,17 @@ class TokenSet:
     input_ids: キャリブレーション用は [n_sequences, seqlen]、
                評価用は [1, tokens] の連結列
     starts:    切り出し開始位置。連続切りのときは空でよい
+    components: 成分を混ぜたセットだけが持つ内訳。metadata() を持つものを
+               並べる。単一ソースでは空
+
+    starts は混合セットでは空にする。成分ごとに別の連結列を切るので、位置を
+    1本に並べると何を基準にした値か分からなくなるためである。
     """
 
     name: str
     input_ids: torch.Tensor
     starts: tuple = ()
+    components: tuple = ()
 
     @property
     def n_sequences(self):
@@ -45,13 +51,17 @@ class TokenSet:
         return self.input_ids.numel()
 
     def metadata(self):
-        return {
+        data = {
             'name': self.name,
             'shape': list(self.input_ids.shape),
             'n_tokens': self.n_tokens,
             'starts': list(self.starts),
             'token_hash': tensor_hash(self.input_ids),
         }
+        if self.components:
+            data['components'] = [component.metadata()
+                                  for component in self.components]
+        return data
 
 
 @dataclass(frozen=True)

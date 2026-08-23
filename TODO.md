@@ -16,8 +16,10 @@ HellaSwag の 0-shot を lm-eval-harness 0.4.12 で通し、**問題ごと・選
 
 検証: `uv run pytest tests/ -q`（CPU、数秒。オラクルは `CMoE-ref/xsearch` と
 ビット一致を確認）、`CMOE_BENCH_INTEGRATION=1 uv run pytest tests/test_bench.py -q`
-（本物の lm-eval を5タスク通す。約20秒）、`uv run python experiments/00_anchor.py`
-（GPU、約25分、既存測定と6桁一致）。
+（本物の lm-eval を5タスク通す。約20秒）、
+`CMOE_SLIMPAJAMA_INTEGRATION=1 uv run pytest tests/test_data_slimpajama.py -q`
+（SlimPajama のシャードを実際に落として引く。初回は 292MB のダウンロード）、
+`uv run python experiments/00_anchor.py`（GPU、約25分、既存測定と6桁一致）。
 
 探索は Llama-2-7B で実走済み（`result_logs/gputest_*`）。全32層 × `local_error`
 × beam 幅2 が 15.8 分、勝った配分の測り直しは差 0。出た配分の PPL は
