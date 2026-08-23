@@ -29,6 +29,10 @@ uv run cmoe search --oracle suffix_kl --search beam --width 4
 # 安い層ローカル指標で探す（後続の層を走らせない）
 uv run cmoe search --oracle local_error --search greedy --width 1
 
+# 探索を走らせず、与えた配分を同じオラクルで採点する。対照の一様配分を
+# 「評価指標を見て選ぶ」のではなく、探索と同じ目的関数で選ぶのに使う
+uv run cmoe score --oracle suffix_kl --alloc uniform3 --alloc uniform4
+
 # 移送が既存の測定と同じ数字を出すかの確認
 uv run python experiments/00_anchor.py
 ```
@@ -53,7 +57,8 @@ src/cmoe/
   alloc/      [軸5] SA 配分。search（探索）と oracles（採点）に分かれる
   eval/       [軸6] PPL・選択問題ベンチマークと、対応のある比較の統計
   assemble.py 組み立て役。軸どうしを繋ぐ知識はここにしか無い
-  cli.py      唯一のドライバ（run = 変換して測る / search = 配分を探す）
+  cli.py      唯一のドライバ（run = 変換して測る / search = 配分を探す /
+              score = 与えた配分を採点する）
 experiments/  1実験1ファイルの薄い設定
 tests/        CPU で数秒で回る動作確認
 ```
@@ -74,7 +79,8 @@ tests/        CPU で数秒で回る動作確認
 - ルーター診断: `|h|` 回収率、Oracle gap 回収率、Top-K の recall と完全一致率
 - 採点オラクル: `mass`（活性質量の回収率）、`mass_squared`、`local_error`（層の
   出力誤差 L）、`suffix_kl`（残りを dense のまま走らせた出力分布の KL）
-- 配分の探索: `beam`（幅を指定）、`greedy`（幅1のビームそのもの）
+- 配分の探索: `beam`（幅を指定）、`greedy`（幅1のビームそのもの）。探索を
+  走らせずに配分を採点するだけの `cmoe score` もある（対照を校正で選ぶため）
 - 評価: PPL と、選択問題ベンチマーク5タスク（`--bench`）
 
 ### 選択問題ベンチマーク

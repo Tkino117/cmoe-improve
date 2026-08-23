@@ -19,6 +19,14 @@
 評価を分けてあるのは、探索が数時間かかる一方で、出た配分を使う実験はその後
 何度も走るからである。
 
+``score`` は探索を走らせず、**与えた配分を同じオラクルで採点するだけ**である。
+
+  cmoe score --oracle suffix_kl --alloc uniform3 --alloc uniform4
+
+対照の選び方を探索と揃えるためにある。探索は校正データだけを見て1本を選ぶので、
+比べる相手の一様配分も同じ目的関数で選ばないと、評価指標を見てから7本の最良を
+取ることになり、対照の側にだけ「たまたまの上振れ」が乗る。
+
 方式の分岐はここに無い。名前は各軸の registry が解決する。
 """
 
@@ -49,6 +57,7 @@ from cmoe.router.registry import create_method, resolve_chain
 
 TEXT_NAME, JSON_NAME = 'run.txt', 'summary.json'
 SEARCH_JSON = 'search.json'
+SCORE_JSON = 'score.json'
 # 選択問題の生の尤度の置き場所。summary.json に混ぜないのは、1構成で 1MB 前後
 # あり、summary.json は1構成終わるたびに丸ごと書き直されるからである
 BENCH_DIR = 'bench'
@@ -171,39 +180,53 @@ def build_parser():
     run.add_argument('--out', default=None)
 
     search = sub.add_parser('search', help='層ごとの x を探す')
-    search.add_argument('--model', default='meta-llama/Llama-2-7b-hf')
-    search.add_argument('--adapter', default=None, help='省略時はモデル名から推測する')
-    search.add_argument('--oracle', default='suffix_kl',
-                        help='採点オラクル。安い順に mass / local_error / suffix_kl')
+    add_oracle_arguments(search, layers_help='先頭 N 層だけ探索する（配線確認用）')
     search.add_argument('--search', default='beam', help='探索アルゴリズム')
     search.add_argument('--width', type=int, default=None,
                         help='各層で生き残る接頭辞の本数。省略時は探索ごとの既定'
                              '（beam は4、greedy は1）')
     search.add_argument('--budget', type=float, default=None,
                         help='オラクルのコスト上限。単位はオラクルが決める')
-    search.add_argument('--carver', default='cmoe', help='分割方式')
-    search.add_argument('--calib', default='wikitext2', help='キャリブレーションセット')
-    search.add_argument('--seed', type=int, default=0)
-    search.add_argument('--nsamples', type=int, default=8,
-                        help='キャリブレーション系列数。探索の全コストがこれに比例する')
-    search.add_argument('--nexperts', type=int, default=8)
-    search.add_argument('--nactive', type=int, default=6,
-                        help='1トークンあたりに走る expert 数 A。全候補で同じ')
-    search.add_argument('--k-act', type=int, default=10)
-    search.add_argument('--bias-speed', type=float, default=0.001)
-    search.add_argument('--seqlen', type=int, default=2048)
-    search.add_argument('--batch-chunk', type=int, default=None,
-                        help='系列を分ける幅。n が大きいときだけ要る')
-    search.add_argument('--token-chunk', type=int, default=None,
-                        help='オラクルがトークンを分ける幅')
-    search.add_argument('--no-profiling-norm', action='store_true')
-    search.add_argument('--no-router-norm', action='store_true')
-    search.add_argument('--layers', type=int, default=None,
-                        help='先頭 N 層だけ探索する（配線確認用）')
     search.add_argument('--no-recheck', action='store_true',
                         help='勝った配分を頭から測り直さない')
-    search.add_argument('--out', default=None)
+
+    score = sub.add_parser('score', help='与えた配分をオラクルで採点する')
+    add_oracle_arguments(score, layers_help='先頭 N 層だけ採点する（配線確認用）')
+    score.add_argument('--alloc', action='append', default=None,
+                       help='採点する配分。プリセット名か層数分のカンマ区切り。'
+                            '繰り返すと全部を採点して並べる')
     return parser
+
+
+def add_oracle_arguments(parser, layers_help):
+    """オラクルを組むのに要る引数。``search`` と ``score`` で同一である。
+
+    採点の条件が1文字でもずれると2つのコマンドの数は比べられないので、
+    別々に並べるのではなく同じ関数から生やす。
+    """
+    parser.add_argument('--model', default='meta-llama/Llama-2-7b-hf')
+    parser.add_argument('--adapter', default=None, help='省略時はモデル名から推測する')
+    parser.add_argument('--oracle', default='suffix_kl',
+                        help='採点オラクル。安い順に mass / local_error / suffix_kl')
+    parser.add_argument('--carver', default='cmoe', help='分割方式')
+    parser.add_argument('--calib', default='wikitext2', help='キャリブレーションセット')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--nsamples', type=int, default=8,
+                        help='キャリブレーション系列数。全コストがこれに比例する')
+    parser.add_argument('--nexperts', type=int, default=8)
+    parser.add_argument('--nactive', type=int, default=6,
+                        help='1トークンあたりに走る expert 数 A。全候補で同じ')
+    parser.add_argument('--k-act', type=int, default=10)
+    parser.add_argument('--bias-speed', type=float, default=0.001)
+    parser.add_argument('--seqlen', type=int, default=2048)
+    parser.add_argument('--batch-chunk', type=int, default=None,
+                        help='系列を分ける幅。n が大きいときだけ要る')
+    parser.add_argument('--token-chunk', type=int, default=None,
+                        help='オラクルがトークンを分ける幅')
+    parser.add_argument('--no-profiling-norm', action='store_true')
+    parser.add_argument('--no-router-norm', action='store_true')
+    parser.add_argument('--layers', type=int, default=None, help=layers_help)
+    parser.add_argument('--out', default=None)
 
 
 def configure_method(method, args):
@@ -715,8 +738,13 @@ def check_search_arguments(args):
     runlog が「終わった結果がある場所」を先に拒むのと同じ理由で、断れるものは
     測る前に断る。
     """
-    check_oracle(args.oracle)
     check_search(args.search, args.width)
+    check_oracle_arguments(args)
+
+
+def check_oracle_arguments(args):
+    """``search`` と ``score`` に共通の、オラクルまわりの引数検査。"""
+    check_oracle(args.oracle)
     if args.layers is not None and args.layers < 1:
         # `args.layers or n_layers` は 0 を falsy として全層に化かす。配線確認の
         # つもりの --layers 0 で本番が始まる
@@ -851,12 +879,109 @@ def alloc_flag(allocation):
     return ','.join(str(x) for x in allocation)
 
 
+def command_score(args):
+    """与えた配分を、探索と同じオラクルで頭から採点する。
+
+    探索を1回も呼ばない。``score_allocation`` は探索が勝った配分を測り直すのに
+    使っているのと同じ関数で、同じ層の進め方・同じ採点を通る。だから、ここで出る
+    数と ``search`` の ``score`` は直接比べられる。
+    """
+    check_oracle_arguments(args)
+    specs = parse_alloc_specs(args.alloc)
+    # 配分の綴り違いはモデルを読む前に出す。層数はまだ分からないので、ここで
+    # 落とせるのは名前と整数の並びだけである
+    searches = [(spec, parse_allocation(spec, args.nactive)) for spec in specs]
+
+    out = args.out or runlog.default_out_dir(f'score_{args.oracle}')
+    runlog.prepare_out_dir(out, SCORE_JSON)
+    runlog.open_mirror(os.path.join(out, TEXT_NAME))
+    json_path = os.path.join(out, SCORE_JSON)
+
+    adapter_name = args.adapter or guess_adapter(args.model)
+    log(f'model={args.model} carve={args.calib} n={args.nsamples} seed={args.seed} '
+        f'N={args.nexperts} A={args.nactive}')
+    log(f'採点 オラクル {args.oracle} × 配分 {len(searches)} 本')
+    log(f'出力 {out}')
+
+    adapter = create_adapter(adapter_name, args.model, seqlen=args.seqlen)
+    calibration = load_calibration(
+        args.calib, args.model, args.seqlen, args.nsamples, args.seed)
+    log(f'  carve: {calibration.name} {tuple(calibration.input_ids.shape)} '
+        f'hash={calibration.metadata()["token_hash"][:12]}')
+
+    walk = build_walk(args, adapter, calibration)
+    oracle = create_oracle(args.oracle, walk)
+    if args.token_chunk is not None and hasattr(oracle, 'token_chunk'):
+        oracle.token_chunk = args.token_chunk
+
+    n_layers = min(args.layers or adapter.n_layers, adapter.n_layers)
+    payload = {
+        'arguments': vars(args),
+        'model': args.model,
+        'n_layers': n_layers,
+        'oracle': {'name': oracle.name, 'cost_unit': oracle.cost_unit},
+        'calibration': calibration.metadata(),
+        'scores': [],
+    }
+    floor = None
+    if hasattr(oracle, 'nondeterminism_floor'):
+        floor = oracle.nondeterminism_floor()
+        payload['nondeterminism'] = floor
+        log(f'dense 読み出しを2回: KL {floor:.3e}（この機械の非決定性の床。'
+            'これより小さい差は区別できない）')
+    runlog.write_json(json_path, payload)
+
+    started = time.time()
+    for index, (spec, search) in enumerate(searches):
+        allocation = search.search(oracle, n_layers)
+        log()
+        log(f'== {index + 1}/{len(searches)} {allocation.name} '
+            f'({alloc_flag(allocation)}) ==')
+        spent_before = oracle.spent
+        elapsed = time.time()
+        result = score_allocation(oracle, allocation)
+        elapsed = time.time() - elapsed
+        log(f'  score {result.score:.6e}  平均 x={allocation.mean_x:.2f}  '
+            f'コスト {oracle.spent - spent_before:g} {oracle.cost_unit}'
+            f'（{elapsed / 60:.1f} 分）')
+        payload['scores'].append({
+            'spec': spec,
+            'allocation': allocation.metadata(),
+            'score': result.score,
+            'cost': oracle.spent - spent_before,
+            'seconds': elapsed,
+            'per_layer': result.details['per_layer'],
+        })
+        runlog.write_json(json_path, payload)
+
+    # 並べて出す。この表の一番良い1本が、探索と対等な選び方をした対照である
+    log()
+    log(f'{"配分":<24} {"平均 x":>7} {"score":>14}')
+    best = min(payload['scores'], key=lambda row: row['score'])
+    for row in payload['scores']:
+        mark = ' <- 最良' if row is best else ''
+        log(f'{row["allocation"]["name"]:<24} '
+            f'{row["allocation"]["mean_x"]:>7.2f} {row["score"]:>14.6e}{mark}')
+    payload['best'] = {'spec': best['spec'],
+                       'name': best['allocation']['name'],
+                       'score': best['score']}
+    runlog.write_json(json_path, payload)
+    log()
+    log('score は同じ校正トークンの上でしか比べられない。'
+        '校正が違う行を並べても意味は無い')
+    log(f'{(time.time() - started) / 60:.1f} 分')
+    runlog.close_mirror()
+    return 0
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.command == 'run':
         return command_run(args)
     if args.command == 'search':
         return command_search(args)
+    if args.command == 'score':
+        return command_score(args)
     raise SystemExit(f'未知のコマンド {args.command!r}')
 
 
