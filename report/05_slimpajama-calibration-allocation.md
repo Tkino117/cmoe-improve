@@ -1,6 +1,7 @@
 # 05 混合コーパスで校正して配分を探す
 
-2026-08-23 / 出力 `result_logs/slimpajama_w2_n16_seed0`、`result_logs/wikitext2_w2_n16_seed0`
+2026-08-23 / 出力 `result_logs/slimpajama_w{2,3,4}_n16_seed0`、
+`result_logs/wikitext2_w2_n16_seed0`
 
 ## 目的
 
@@ -74,14 +75,14 @@ ArXiv と Book は1文書が必要量を超えるため、それぞれ1文書か
 | モデル / 層数 | `meta-llama/Llama-2-7b-hf` / 32 |
 | N（expert 数）/ A（1トークンあたり） | 8 / 6 |
 | 採点オラクル | `suffix_kl` |
-| 探索 | beam 幅2 |
+| 探索 | beam。slimpajama は幅2 / 3 / 4、対照は幅2 |
 | ルーター / 分割 | 現行 CMoE（k_act 10 / bias_speed 0.001） |
 | seqlen | 2048 |
 | seed | 0 |
 | 環境 | RTX PRO 5000 Blackwell、Python 3.11.14 / PyTorch 2.8.0+cu128 / transformers 4.47.1 / datasets 2.21.0 |
-| コード | `0ec4646` + 未コミットの校正セット実装（`src/cmoe/data/slimpajama.py`、`wikitext2.non_overlapping_starts`） |
+| コード | `cdc90c6`。slimpajama 幅2 と wikitext2 n=16 は同内容の未コミット状態で測った。wikitext2 n=8 は report/01 当時のコード |
 
-対照を2つ置く。
+対照を2つ置く。どちらも幅2 だけである。
 
 - **wikitext2 n=8** — report/01・report/03 の既存測定をそのまま引いた
   （`result_logs/calib_seed_variance_suffix_kl_w2/search_seed0`）
@@ -89,8 +90,11 @@ ArXiv と Book は1文書が必要量を超えるため、それぞれ1文書か
   n を変えると窓の引き方が変わるので、n=8 とは別物である
 
 ```bash
-uv run cmoe search --calib slimpajama --nsamples 16 --oracle suffix_kl \
-  --search beam --width 2 --seed 0 --out result_logs/slimpajama_w2_n16_seed0
+for width in 2 3 4; do
+  uv run cmoe search --calib slimpajama --nsamples 16 --oracle suffix_kl \
+    --search beam --width $width --seed 0 \
+    --out result_logs/slimpajama_w${width}_n16_seed0
+done
 uv run cmoe search --calib wikitext2 --nsamples 16 --oracle suffix_kl \
   --search beam --width 2 --seed 0 --out result_logs/wikitext2_w2_n16_seed0
 ```
@@ -100,25 +104,30 @@ uv run cmoe search --calib wikitext2 --nsamples 16 --oracle suffix_kl \
 ### 出てきた配分（層0から順の x）
 
 ```
-wikitext2  n=8   4,4,5,6,6,4,6,6,6,1,3,5,0,3,4,4,3,5,5,6,3,3,5,6,2,5,4,2,6,6,1,2
-wikitext2  n=16  3,5,6,6,4,5,5,6,4,2,3,6,0,2,5,3,5,6,6,6,6,6,5,6,6,6,5,4,4,4,4,2
-slimpajama n=16  6,6,6,6,6,6,5,5,6,0,4,3,3,3,4,5,4,6,6,4,4,6,2,6,4,6,6,6,5,3,4,6
+wikitext2  n=8   幅2  4,4,5,6,6,4,6,6,6,1,3,5,0,3,4,4,3,5,5,6,3,3,5,6,2,5,4,2,6,6,1,2
+wikitext2  n=16  幅2  3,5,6,6,4,5,5,6,4,2,3,6,0,2,5,3,5,6,6,6,6,6,5,6,6,6,5,4,4,4,4,2
+slimpajama n=16  幅2  6,6,6,6,6,6,5,5,6,0,4,3,3,3,4,5,4,6,6,4,4,6,2,6,4,6,6,6,5,3,4,6
+slimpajama n=16  幅3  4,6,6,5,6,6,5,6,4,2,4,2,3,3,4,4,5,6,5,4,6,4,5,5,3,6,6,6,5,2,4,2
+slimpajama n=16  幅4  4,6,6,5,6,6,5,6,4,2,4,2,3,3,4,4,5,6,5,4,6,4,5,5,3,4,6,6,4,2,2,4
 ```
 
-| 校正 | 本数 | トークン | トークンのハッシュ | 平均 x | score (`suffix_kl`) | コスト | 測り直しの差 | 所要 |
-|---|---|---|---|---|---|---|---|---|
-| wikitext2 n=8 | 8 | 16,384 | `65a051f78ade` | 4.0938 | 1.882924e-01 | 7,168 | 0.000e+00 | 21.1 分 |
-| wikitext2 n=16 | 16 | 32,768 | `5453d5d910b0` | 4.5625 | 1.947526e-01 | 7,168 | 0.000e+00 | 35.9 分 |
-| slimpajama n=16 | 16 | 32,768 | `37738f7c8d47` | 4.7500 | 1.836402e-01 | 7,168 | 0.000e+00 | 35.2 分 |
+| 校正 | 幅 | 本数 | トークン | トークンのハッシュ | 平均 x | score (`suffix_kl`) | コスト | 評価回数 | 測り直しの差 | 所要 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| wikitext2 n=8 | 2 | 8 | 16,384 | `65a051f78ade` | 4.0938 | 1.882924e-01 | 7,168 | 441 | 0.000e+00 | 21.1 分 |
+| wikitext2 n=16 | 2 | 16 | 32,768 | `5453d5d910b0` | 4.5625 | 1.947526e-01 | 7,168 | 441 | 0.000e+00 | 35.9 分 |
+| slimpajama n=16 | 2 | 16 | 32,768 | `37738f7c8d47` | 4.7500 | 1.836402e-01 | 7,168 | 441 | 0.000e+00 | 35.2 分 |
+| slimpajama n=16 | 3 | 16 | 32,768 | `37738f7c8d47` | 4.5000 | 1.818547e-01 | 10,640 | 658 | 0.000e+00 | 53.0 分 |
+| slimpajama n=16 | 4 | 16 | 32,768 | `37738f7c8d47` | 4.4062 | 1.805907e-01 | 14,112 | 875 | 0.000e+00 | 69.3 分 |
 
-**score は行をまたいで比べられない。** 各行はそれぞれ自分の校正トークンの上で
-測った KL である。
+**score は校正をまたいで比べられない。** 各行はそれぞれ自分の校正トークンの上で
+測った KL である（slimpajama の3行は同じトークンなので、その3行どうしは比べられる）。
 
-コストは `layer_forwards`（441 回の呼び出し）。機械の非決定性の床はどの探索でも
-0.000e+00 で、3本すべて、勝った配分を頭から測り直した差は 0.000e+00 だった。
-失敗した構成は無い。
+コストの単位は `layer_forwards`。機械の非決定性の床はどの探索でも 0.000e+00 で、
+5本すべて、勝った配分を頭から測り直した差は 0.000e+00 だった。失敗した探索は無い。
 
 ### 配分どうしの一致
+
+**校正のあいだ**（どれも幅2）
 
 | 比較 | 一致した層 | 平均 \|差\| |
 |---|---|---|
@@ -126,9 +135,19 @@ slimpajama n=16  6,6,6,6,6,6,5,5,6,0,4,3,3,3,4,5,4,6,6,4,4,6,2,6,4,6,6,6,5,3,4,6
 | wikitext2 n=16 vs slimpajama n=16 | 9/32 | 1.31 |
 | wikitext2 n=8 vs slimpajama n=16 | 6/32 | 1.53 |
 
+**幅のあいだ**（どれも slimpajama n=16）
+
+| 比較 | 一致した層 | 平均 \|差\| |
+|---|---|---|
+| 幅2 vs 幅3 | 16/32 | 0.81 |
+| 幅3 vs 幅4 | 28/32 | 0.22 |
+| 幅2 vs 幅4 | 13/32 | 0.91 |
+
+幅3 と幅4 は層0〜24 が同一で、分かれるのは層25 以降の4層である。
+
 ## 保存されているもの
 
-- `result_logs/slimpajama_w2_n16_seed0/search.json`、
+- `result_logs/slimpajama_w{2,3,4}_n16_seed0/search.json`、
   `result_logs/wikitext2_w2_n16_seed0/search.json` — 全層 × 全親 × 全候補
   （x=0〜6）のスコア、落選候補も含む枝の系譜、全引数、勝った配分の測り直し
 - 同 `search.json` の `calibration.components` — 成分ごとの本数・開始位置・
