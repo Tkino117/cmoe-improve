@@ -36,7 +36,10 @@ wikitext2 で **6.992** に対し `uniform3` が **7.072**（対照比 NLL -0.01
    探索配分は最良の一様配分を**どの指標でも上回らなかった**。対照の取り方は
    決めた — 一様7本を探索と同じ `suffix_kl` で採点して選ぶ（`cmoe score`）。
    両側とも「校正だけを見て選んだ1本」になる。
-   slimpajama 校正の seed 3本は [experiments/06](experiments/06_slimpajama_seeds/)
+   slimpajama 校正の seed 3本は済んだ — [report/07](report/07_slimpajama-alloc-3seeds.md)。
+   PPL は3対照とも幅4 で 3/3 seed・区間も0をまたがない。ベンチの `gold_nll` は
+   固定 uniform3 に対してのみ判定を満たし、校正で選んだ一様に対しては区間が
+   0をまたぐ
 4. `suffix_kl` の全32層はまだ走らせていない（既定の幅4 なら数時間。`presets.py`
    の `beam` はこの目的関数の産物なので、突き合わせる相手がある）
 
