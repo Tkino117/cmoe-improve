@@ -88,7 +88,8 @@ tests/        CPU で数秒で回る動作確認
 既定のタスクは PIQA / WinoGrande / ARC-e / ARC-c / HellaSwag の 0-shot で、
 CMoE 最新版（ACL 2026, arXiv:2502.04416）Table 1 と同じ並びであり、
 ExpertWeaver（arXiv:2602.15521）Table 2 との共通部分でもある。どちらの論文も
-主表の動作点はスパース率25%で、ここの N=8 / A=6 がちょうどそれに当たる。
+主表の動作点はスパース率25%で、ここの N=8 / A=6 がちょうどそれに当たる。動作点は
+`--nactive` で替えられる（N=8 で A=4 なら50%。[report/08](report/08_sparsity50-alloc-3seeds.md)）。
 
 **正答率だけを見ない。** 選択問題の採点は選択肢ごとの対数尤度の argmax であり、
 正答率はマージンの**符号**しか見ない。ここで問題になる差（PPL 0.03 ≒ 1トークン
