@@ -48,11 +48,13 @@ from cmoe.alloc.search.registry import check_search, create_search
 from cmoe.assemble import Converter, install_routers, layer_factory
 from cmoe.carve.registry import create_carver
 from cmoe.data.base import load_tokenizer
+from cmoe.data.harness import DEFAULT_CACHE as DEFAULT_BENCH_CACHE
 from cmoe.data.registry import load_calibration, load_evaluation, load_splits
 from cmoe.eval import bench, bench_stats
 from cmoe.eval.ppl import evaluate_ppl
 from cmoe.eval.stats import paired_differences, stratified_paired_bootstrap
 from cmoe.router.diagnostics import gap_recovered
+from cmoe.router.methods.score_calibration import GAIN_LIMIT
 from cmoe.router.registry import create_method, resolve_chain
 
 TEXT_NAME, JSON_NAME = 'run.txt', 'summary.json'
@@ -61,11 +63,6 @@ SCORE_JSON = 'score.json'
 # 選択問題の生の尤度の置き場所。summary.json に混ぜないのは、1構成で 1MB 前後
 # あり、summary.json は1構成終わるたびに丸ごと書き直されるからである
 BENCH_DIR = 'bench'
-# ベンチのデータセットは既定の共有キャッシュを使わない。理由は
-# ``cmoe.eval.bench.datasets_cache`` にある（固定した datasets 2.21.0 では
-# 読めない索引が共有キャッシュに混じっている）。合計 100MB 弱で済む
-DEFAULT_BENCH_CACHE = os.environ.get(
-    'CMOE_BENCH_CACHE', os.path.join('.cache', 'hf-datasets'))
 DEFAULT_ALLOC = 'uniform3'
 log = runlog.log
 
@@ -150,6 +147,10 @@ def build_parser():
                      help='方式4 の座標上昇がトークンを分けて進める幅')
     run.add_argument('--keep-top', type=int, default=16,
                      help='方式3 が記録する上位候補の数')
+    run.add_argument('--gain-limit', type=float, default=GAIN_LIMIT,
+                     help='方式5 の gain の探索幅（1/x 〜 x）')
+    run.add_argument('--no-bias', action='store_true',
+                     help='方式5 の offset 段を走らせない（gain だけ合わせる）')
     run.add_argument('--max-sweeps', type=int, default=10,
                      help='方式4 の座標上昇の掃引上限')
     run.add_argument('--no-profiling-norm', action='store_true')
@@ -233,7 +234,9 @@ def configure_method(method, args):
     """CLI の分割幅を方式へ渡す。方式ごとの分岐ではなく、持っていれば設定する。"""
     for name, value in (('chunk_size', args.token_chunk),
                         ('keep_top', args.keep_top),
-                        ('max_sweeps', args.max_sweeps)):
+                        ('max_sweeps', args.max_sweeps),
+                        ('gain_limit', args.gain_limit),
+                        ('fit_bias', not args.no_bias)):
         if hasattr(method, name):
             setattr(method, name, value)
     if hasattr(method, 'token_chunk'):

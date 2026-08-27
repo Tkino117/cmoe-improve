@@ -15,6 +15,7 @@ GPU のアンカー（experiments/00_anchor.py）は end-to-end の PPL を突�
 import importlib.util
 from pathlib import Path
 import sys
+import types
 
 import torch
 import torch.nn as nn
@@ -144,3 +145,31 @@ def test_diagnostics_match_reference(fixtures):
     for key in ('router_r', 'oracle_r', 'oracle_mean_recall',
                 'oracle_exact_set_rate', 'mean_representative_mass_correlation'):
         assert expected[key] == got[key], key
+
+
+def test_score_calibration_matches_reference(fixtures):
+    from cmoe.router.methods.score_calibration import calibrate_router_scores
+
+    # 元実装の方式5 は方式4 を ``routerlab.methods`` 経由で読む。パス指定で読む
+    # ここでは、その1本だけを本物の名前で先に登録して繋ぐ。
+    package = types.ModuleType('routerlab')
+    package.__path__ = []
+    methods = types.ModuleType('routerlab.methods')
+    methods.__path__ = []
+    sys.modules.setdefault('routerlab', package)
+    sys.modules.setdefault('routerlab.methods', methods)
+    load('routerlab.methods.oracle_recovery', 'oracle_recovery.py')
+    reference = load('ref_sc', 'score_calibration.py')
+    representatives = tuple(group[0] for group in fixtures['routed'])
+    arguments = (fixtures['groups'], 2, fixtures['z'], fixtures['gate'],
+                 fixtures['up'], representatives)
+    expected = reference.calibrate_router_scores(*arguments)
+    got = calibrate_router_scores(*arguments)
+    assert expected.gains == got.gains
+    assert expected.biases == got.biases
+    assert expected.recovery == got.recovery
+    assert expected.gain_recovery == got.gain_recovery
+    assert expected.faithfulness == got.faithfulness
+    # 探索の経路まで一致する（受理した手の段・expert・行き先）
+    assert ([(move['stage'], move['expert'], move['to']) for move in expected.moves]
+            == [(move['stage'], move['expert'], move['to']) for move in got.moves])

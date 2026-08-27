@@ -4,12 +4,14 @@
 評価にしか使わないもの（c4-new）、carve にしか使わないものが今後も出るため。
 """
 
-from cmoe.data import c4, slimpajama, wikitext2
+from cmoe.data import benchtrain, c4, slimpajama, wikitext2
 
 CALIBRATION_SETS = {
     'wikitext2': wikitext2.calibration,
     'c4': c4.calibration,
     'slimpajama': slimpajama.calibration,
+    # 選択問題の train split。評価に使う split は入らない
+    'benchtrain': benchtrain.calibration,
 }
 
 # ルーター方式が要る carve / fit / validation の3本組。

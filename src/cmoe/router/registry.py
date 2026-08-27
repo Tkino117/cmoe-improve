@@ -7,6 +7,7 @@ from cmoe.router.methods.frequency_centroid import FrequencyCentroidMethod
 from cmoe.router.methods.oracle_abs import OracleAbsMethod
 from cmoe.router.methods.oracle_correlation import OracleCorrelationMethod
 from cmoe.router.methods.oracle_recovery import OracleRecoveryMethod
+from cmoe.router.methods.score_calibration import ScoreCalibrationMethod
 
 METHODS = {
     # 方式1: 現行 CMoE。すべての実験の対照
@@ -17,6 +18,8 @@ METHODS = {
     'oracle_correlation': OracleCorrelationMethod,
     # 方式4: 回収率の共同最適化（本命）
     'oracle_recovery': OracleRecoveryMethod,
+    # 方式5: 代表を凍結し、expert ごとの score の gain と offset を合わせる
+    'score_calibration': ScoreCalibrationMethod,
     # 方式6: expert の行の平均
     'expert_mean': ExpertMeanMethod,
     'expert_mean_centered': CenteredExpertMeanMethod,
@@ -42,13 +45,21 @@ def resolve_chain(names):
     """要求された方式を、依存を満たす構築順に並べ直す。
 
     ``oracle_recovery`` は初期代表集合を要求するので、先行3方式を前に挿す。
-    それ以外の方式は互いに独立なので、要求された順のまま後ろに置く。
+    ``frozen_source`` を持つ方式（方式5）は凍結する相手そのものを要求するので、
+    その方式を前に挿す。それ以外の方式は互いに独立なので、要求された順のまま
+    後ろに置く。
     """
     requested = list(dict.fromkeys(names))
-    order = []
-    if 'oracle_recovery' in requested:
-        order.extend(RECOVERY_CHAIN)
+    # 凍結型の方式は、凍結する相手が先に居ないと作れない
+    needed = list(requested)
     for name in requested:
+        frozen = getattr(METHODS.get(name), 'frozen_source', None)
+        if frozen is not None and frozen not in needed:
+            needed.insert(needed.index(name), frozen)
+    order = []
+    if 'oracle_recovery' in needed:
+        order.extend(RECOVERY_CHAIN)
+    for name in needed:
         if name not in order:
             order.append(name)
     if 'cmoe' not in order:

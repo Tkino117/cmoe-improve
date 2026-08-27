@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 import numpy
 import torch
 
+from cmoe.data.harness import datasets_cache, gold_index as _gold_index, load_tasks
+
 # CMoE 最新版 Table 1 と同じ並び。ExpertWeaver Table 2 との共通部分でもある
 DEFAULT_TASKS = ('piqa', 'winogrande', 'arc_easy', 'arc_challenge', 'hellaswag')
 
@@ -101,34 +103,6 @@ def load_samples(path):
 
 
 @contextlib.contextmanager
-def datasets_cache(path):
-    """タスクのデータセットを、指定したキャッシュから読む。
-
-    このプロジェクトは ``datasets==2.21.0`` に固定してある（層の呼び出し規約の
-    都合で transformers 4.47.1 に固定され、その組み合わせで検証されているのが
-    そこまでのため）。一方 HuggingFace の既定のキャッシュは計算機で共有されて
-    おり、そこに新しい ``datasets`` が書いた索引が混じっていると、2.21.0 は
-    知らない特徴量の型（``List`` など）で読めずに落ちる。実際 ARC と HellaSwag
-    がそうなっていた。
-
-    ベンチマークのぶんだけ別のキャッシュを見ることで、PPL 側が使っている
-    WikiText-2 / C4 の経路（既存の測定と6桁一致することが確かめてある）に
-    手を触れずに済む。``path`` が None なら既定のキャッシュのまま。
-    """
-    if path is None:
-        yield
-        return
-    import datasets
-
-    before = datasets.config.HF_DATASETS_CACHE
-    datasets.config.HF_DATASETS_CACHE = path
-    try:
-        yield
-    finally:
-        datasets.config.HF_DATASETS_CACHE = before
-
-
-@contextlib.contextmanager
 def _isolated_rng():
     """大域の乱数状態を、入る前の値に戻して出る。
 
@@ -147,53 +121,6 @@ def _isolated_rng():
         torch.set_rng_state(states[2])
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
-
-
-def load_tasks(names, cache_dir=None):
-    """タスク名から lm-eval のタスク実体を作る。
-
-    実体を自分で持つのは、正解番号を出すのに ``doc_to_target`` /
-    ``doc_to_choice`` が要るからである。``simple_evaluate`` は実体をそのまま
-    受け取れるので、データセットの読み込みは1回で済む。
-    """
-    from lm_eval.tasks import TaskManager
-
-    names = list(names)
-    with datasets_cache(cache_dir):
-        loaded = TaskManager().load(names)['tasks']
-    missing = [name for name in names if name not in loaded]
-    if missing:
-        raise ValueError(f'lm-eval に無いタスク: {", ".join(missing)}')
-    for name in names:
-        output_type = loaded[name].get_config('output_type')
-        if output_type != 'multiple_choice':
-            raise ValueError(
-                f'{name} は output_type={output_type} で、選択肢ごとの尤度が'
-                '出ない。ここが扱うのは multiple_choice だけ')
-    return {name: loaded[name] for name in names}
-
-
-def _gold_index(task, doc, n_choices):
-    """lm-eval が正誤の判定に使う正解番号。
-
-    ``api/task.py`` の multiple_choice 版 ``process_results`` の導出を写した
-    もの。``multiple_input`` のタスク（WinoGrande）では選択肢が「続き」ではなく
-    「文脈」の側に立つので、正解番号は ``doc_to_text`` から来る。
-    """
-    if getattr(task, 'multiple_input', 0):
-        gold = task.doc_to_text(doc)
-    else:
-        gold = task.doc_to_target(doc)
-    if isinstance(gold, list):
-        raise ValueError(f'{task.config.task}: 正解が複数ある問題は扱わない')
-    if isinstance(gold, str):
-        choices = task.doc_to_choice(doc)
-        gold = choices.index(gold) if gold in choices else -100
-    gold = int(gold)
-    if not 0 <= gold < n_choices:
-        raise ValueError(
-            f'{task.config.task}: 正解番号 {gold} が選択肢 {n_choices} 個に収まらない')
-    return gold
 
 
 def _check_against_harness(name, example, gold, lls, lengths):

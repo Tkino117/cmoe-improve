@@ -72,9 +72,11 @@ tests/        CPU で数秒で回る動作確認
 6つの軸すべてが移送済み。
 
 - 校正セット: `wikitext2`、`c4`、`slimpajama`（SlimPajama の7成分を層化して引く。
-  成分ごとの本数を固定するので、seed を振っても組成が変わらない）
+  成分ごとの本数を固定するので、seed を振っても組成が変わらない）、`benchtrain`
+  （選択問題5タスクの train split を層化して引く。評価に使う split は入らない）
 - アダプタ: `llama`（既存の測定を再現する経路）、`auto`（同じ層構造の他モデル）
 - ルーター方式: 現行 CMoE、頻度重心、Oracle 相関、回収率の共同最適化、
+  score 校正（代表を凍結し expert ごとの gain と offset を座標上昇で合わせる）、
   expert 平均（素/centered）、診断用 `|h|` オラクル
 - ルーター診断: `|h|` 回収率、Oracle gap 回収率、Top-K の recall と完全一致率
 - 採点オラクル: `mass`（活性質量の回収率）、`mass_squared`、`local_error`（層の

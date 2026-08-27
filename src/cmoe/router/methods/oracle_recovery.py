@@ -37,7 +37,7 @@ from cmoe.router.methods.oracle_correlation import (activation, flatten_z,
                                                     validate_weights)
 
 
-def _clean_group(group, n_neurons, label):
+def clean_group(group, n_neurons, label):
     group = tuple(int(index) for index in group)
     if not group:
         raise ValueError(f'{label} が空')
@@ -85,7 +85,7 @@ class RecoverySelection:
 
 
 @torch.no_grad()
-def _expert_masses(z, groups, gate_weight, up_weight, chunk_size):
+def expert_masses(z, groups, gate_weight, up_weight, chunk_size):
     """トークンごとの真の |h| 質量: shared グループと各 routed グループ。"""
     device = gate_weight.device
     n_tokens = z.shape[0]
@@ -195,8 +195,8 @@ def _prepare_search(expert_groups, z, gate_weight, up_weight, initial_sets,
 
     groups = [()]
     if expert_groups and expert_groups[0]:
-        groups[0] = _clean_group(expert_groups[0], n_neurons, 'shared グループ')
-    routed_groups = [_clean_group(group, n_neurons, f'routed expert {index}')
+        groups[0] = clean_group(expert_groups[0], n_neurons, 'shared グループ')
+    routed_groups = [clean_group(group, n_neurons, f'routed expert {index}')
                      for index, group in enumerate(expert_groups[1:])]
     groups.extend(routed_groups)
     n_routed = len(routed_groups)
@@ -224,7 +224,7 @@ def _prepare_search(expert_groups, z, gate_weight, up_weight, initial_sets,
                 f'候補プールが {len(candidate_pools)} 個、routed expert は {n_routed} 個')
         pools = []
         for expert, pool in enumerate(candidate_pools):
-            pool = _clean_group(pool, n_neurons, f'候補プール {expert}')
+            pool = clean_group(pool, n_neurons, f'候補プール {expert}')
             members = set(routed_groups[expert])
             outside = [neuron for neuron in pool if neuron not in members]
             if outside:
@@ -241,7 +241,7 @@ def _prepare_search(expert_groups, z, gate_weight, up_weight, initial_sets,
         score_gate = F.normalize(score_gate, p=2, dim=1)
         score_up = F.normalize(score_up, p=2, dim=1)
 
-    routed, shared = _expert_masses(z, groups, gate_weight, up_weight, chunk_size)
+    routed, shared = expert_masses(z, groups, gate_weight, up_weight, chunk_size)
     total = float((shared + routed.sum(dim=1)).sum(dtype=torch.float64))
     if not total > 0:
         raise ValueError(f'fit の活性量が {total}')

@@ -316,16 +316,19 @@ class Converter:
 
         routers = {}
         initial_sets = []
+        rows = {}
         for method in self.router_methods:
             context = make_context(
                 index, dense, partition, topk, method,
                 rates=rates, markers=markers, fit_z=fit_z,
-                normalize=self.router_norm, initial_sets=tuple(initial_sets))
+                normalize=self.router_norm,
+                initial_sets=self._starting_sets(method, initial_sets, rows))
             router = build_router(method, context, baseline)
             routers[method.name] = router
 
             row = router_representative_indices(router, partition)
             record.representatives[method.name] = row
+            rows[method.name] = row
             selection = getattr(router, 'selection', None)
             if selection is not None:
                 record.selections[method.name] = selection
@@ -348,6 +351,28 @@ class Converter:
                     dense.up_proj.weight.detach(),
                     chunk_size=self.token_chunk)
         return routers, record
+
+    def _starting_sets(self, method, initial_sets, rows):
+        """その方式に渡す初期代表集合。
+
+        既定は「先行方式が選んだ相異なる集合すべて」で、方式4 はそのそれぞれから
+        探索する。``frozen_source`` を宣言した方式（方式5）は代表を1つも動かさず、
+        名指しした方式の代表を**そのまま凍結する**ので、渡すのは1本だけである。
+        どの方式を凍結したかが方式の側の宣言になり、組み立て役に方式ごとの分岐が
+        増えない。
+        """
+        source = getattr(method, 'frozen_source', None)
+        if source is None:
+            return tuple(initial_sets)
+        if source not in rows:
+            raise ValueError(
+                f'{method.name} は {source!r} の代表を凍結するが、'
+                f'{source!r} がこの構築順の前に居ない')
+        if rows[source] is None:
+            raise ValueError(
+                f'{method.name} は {source!r} の代表を凍結するが、'
+                f'{source!r} は代表を持たない')
+        return (rows[source],)
 
     @torch.no_grad()
     def _profile(self, dense, z):
