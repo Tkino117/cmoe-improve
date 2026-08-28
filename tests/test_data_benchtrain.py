@@ -72,6 +72,11 @@ def test_the_remainder_goes_in_task_order():
                      'arc_challenge': 1, 'hellaswag': 1}
 
 
+def test_a_single_task_takes_every_window():
+    """タスクを1つに絞った系。本数は減らさず、全部をそのタスクから引く。"""
+    assert allocate(8, ('arc_challenge',)) == {'arc_challenge': 8}
+
+
 def test_a_count_below_the_number_of_tasks_is_refused():
     with pytest.raises(ValueError, match='1本ずつ配れない'):
         allocate(len(TASKS) - 1)
@@ -80,6 +85,14 @@ def test_a_count_below_the_number_of_tasks_is_refused():
 def test_the_task_list_matches_the_benchmark():
     """校正が引くタスクと、評価が測るタスクが黙って分かれないための検査。"""
     assert TASKS == bench.DEFAULT_TASKS
+
+
+def test_every_task_has_a_single_task_calibration_set():
+    """5×5 の行になる ``benchtrain:<task>`` が、タスクの数だけ揃っている。"""
+    from cmoe.data.registry import CALIBRATION_SETS
+
+    for task in TASKS:
+        assert f'benchtrain:{task}' in CALIBRATION_SETS
 
 
 # --- 1問をテキストに直す ----------------------------------------------------
@@ -193,3 +206,17 @@ def test_draws_a_stratified_set():
 
     other = calibration(model, 2048, 8, 1)
     assert other.metadata()['token_hash'] != meta['token_hash']
+
+
+@pytest.mark.skipif(not INTEGRATION,
+                    reason='CMOE_BENCHTRAIN_INTEGRATION=1 で走る')
+def test_a_single_task_set_draws_only_that_task():
+    """母集団が最も小さい ARC-Challenge だけで n=8 が引けることを実物で見る。"""
+    from cmoe.data.registry import load_calibration
+
+    tokens = load_calibration('benchtrain:arc_challenge',
+                              'meta-llama/Llama-2-7b-hf', 2048, 8, 0)
+    assert tuple(tokens.input_ids.shape) == (8, 2048)
+    meta = tokens.metadata()
+    assert [row['name'] for row in meta['components']] == ['arc_challenge']
+    assert meta['components'][0]['n_sequences'] == 8

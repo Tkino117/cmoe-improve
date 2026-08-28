@@ -143,16 +143,22 @@ def draw_component(tokenizer, texts, seqlen, count, seed, name):
 
 
 def calibration(model, seqlen, n_samples, seed, name='benchtrain',
-                cache_dir=DEFAULT_CACHE):
-    """5タスクを層化して引いた n_samples 本。
+                cache_dir=DEFAULT_CACHE, tasks=TASKS):
+    """``tasks`` を層化して引いた n_samples 本。既定は5タスク全部。
+
+    ``tasks`` を1つに絞ると「そのタスクだけで校正する」系になる。総トークン数は
+    n_samples × seqlen で変わらないので、タスクの数を減らしても量は動かない。
+    5タスクぶんの窓を1タスクから引くことになるが、母集団が最も小さい
+    ARC-Challenge（train 1,119 問・約 47,000 トークン）でも n=8 は
+    ``MIN_MARGIN`` を満たす。
 
     ``TokenSet.starts`` は空にする。開始位置はタスクごとに別の連結列に対する
     ものなので、1本に並べると基準を失う。位置は ``components`` の側に残る。
     """
-    counts = allocate(n_samples)
+    counts = allocate(n_samples, tasks)
     tokenizer = load_tokenizer(model)
     blocks, components = [], []
-    for task_name in TASKS:
+    for task_name in tasks:
         block, component = draw_component(
             tokenizer, documents(task_name, cache_dir), seqlen,
             counts[task_name], seed, task_name)
