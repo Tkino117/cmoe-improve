@@ -118,8 +118,8 @@ def layer_factory(carver, n_experts, bias_speed=0.001, router_norm=True,
     取り決めである。
     """
     @torch.no_grad()
-    def build(dense, rates, markers, n_shared, topk):
-        partition = carver.carve(dense, rates, markers, n_shared)
+    def build(dense, rates, markers, n_shared, topk, z=None):
+        partition = carver.carve(dense, rates, markers, n_shared, z=z)
         router = build_baseline_router(dense, partition, topk,
                                        bias_speed=bias_speed,
                                        normalize=router_norm)
@@ -234,7 +234,7 @@ class Converter:
                 carve_inputs.position_ids, batch_chunk=self.batch_chunk)
 
             rates, markers = self._profile(dense, z)
-            partition = self.carver.carve(dense, rates, markers, n_shared)
+            partition = self.carver.carve(dense, rates, markers, n_shared, z=z)
             baseline = build_baseline_router(
                 dense, partition, topk, bias_speed=self.bias_speed,
                 normalize=self.router_norm)

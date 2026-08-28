@@ -297,7 +297,7 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
 
     converter = Converter(
         adapter,
-        create_carver(args.carver, args.nexperts),
+        create_carver(args.carver, args.nexperts, k_act=args.k_act),
         methods,
         n_experts=args.nexperts,
         k_act=args.k_act,
@@ -725,7 +725,8 @@ def build_walk(args, adapter, calibration):
     """
     inputs = adapter.capture_layer_inputs(calibration.input_ids)
     factory = layer_factory(
-        create_carver(args.carver, args.nexperts), args.nexperts,
+        create_carver(args.carver, args.nexperts, k_act=args.k_act),
+        args.nexperts,
         bias_speed=args.bias_speed, router_norm=not args.no_router_norm,
         device=adapter.device)
     return LayerWalk(

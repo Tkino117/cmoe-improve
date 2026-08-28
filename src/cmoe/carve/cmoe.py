@@ -19,17 +19,43 @@ from cmoe.carve.base import Partition
 
 
 class CMoECarver:
-    """現行 CMoE の分割。すべての実験の対照になる。"""
+    """現行 CMoE の分割。すべての実験の対照になる。
+
+    派生の分割方式が差し替えるのは2箇所だけである。
+
+    ``_features``      … クラスタリングの距離を測る特徴（既定は 0/1 の markers）
+    ``_shared_scores`` … shared に抜くニューロンの順位（既定は活性頻度）
+
+    どちらも ``z``（その層の FFN 入力）を受け取れる。活性の**大きさ**を見る
+    方式は markers からは作れないので、必要なものは自分で計算する。既定の
+    経路は z を読まないので、値は移送元と一致したままである。
+
+    種の選び方（クラスタ中心の初期値）は常に活性頻度で、派生でも変えない。
+    変えると「shared の選び方を変えた」のか「初期値を変えた」のか分からなく
+    なるためである。
+    """
 
     name = 'cmoe'
+    # 活性プロファイルの上位何個に印を付けたか。大きさを見る方式だけが読む
+    k_act = 10
+    # クラスタ割り当ての反復上限。移送元は1回で止めている
+    max_iters = 1
 
     def __init__(self, n_experts):
         if n_experts < 1:
             raise ValueError(f'n_experts は 1 以上 (受け取った値: {n_experts})')
         self.n_experts = n_experts
 
+    def _features(self, dense, rates, markers, z):
+        """クラスタリングに使う [トークン, ニューロン] の特徴。"""
+        return markers
+
+    def _shared_scores(self, dense, rates, markers, z):
+        """shared に抜く順位。大きいほど shared に入りやすい。"""
+        return rates
+
     @torch.no_grad()
-    def carve(self, dense, rates, markers, n_shared):
+    def carve(self, dense, rates, markers, n_shared, z=None):
         if not 0 <= n_shared < self.n_experts:
             raise ValueError(
                 f'n_shared={n_shared} は 0..{self.n_experts - 1} の外')
@@ -48,7 +74,9 @@ class CMoECarver:
                 '余りが黙って捨てられる')
 
         groups, representatives = _kmeans_groups(
-            rates, markers, self.n_experts, n_shared)
+            rates, self._features(dense, rates, markers, z), self.n_experts,
+            n_shared, max_iters=self.max_iters,
+            shared_scores=self._shared_scores(dense, rates, markers, z))
         partition = Partition(
             n_experts=self.n_experts,
             n_shared=n_shared,
@@ -60,15 +88,17 @@ class CMoECarver:
 
 @torch.no_grad()
 def _kmeans_groups(activation_rates, activation_markers, num_experts,
-                   num_shared_experts):
+                   num_shared_experts, max_iters=1, shared_scores=None):
     hidden_size = activation_rates.shape[0]
     neurons_per_expert = hidden_size // num_experts
 
     expert_groups = []
     remaining_indices = set(range(hidden_size))
     markers = activation_markers.float()
+    if shared_scores is None:
+        shared_scores = activation_rates
 
-    _, top_indices = torch.topk(activation_rates, neurons_per_expert * num_shared_experts)
+    _, top_indices = torch.topk(shared_scores, neurons_per_expert * num_shared_experts)
     shared_expert_indices = top_indices.tolist()
     expert_groups.append(shared_expert_indices)
     remaining_indices -= set(shared_expert_indices)
@@ -89,7 +119,6 @@ def _kmeans_groups(activation_rates, activation_markers, num_experts,
 
     centroids = markers[:, selected_index].clone()
 
-    max_iters = 1
     prev_assignments = None
 
     for _ in range(max_iters):

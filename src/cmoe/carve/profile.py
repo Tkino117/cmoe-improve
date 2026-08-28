@@ -73,3 +73,50 @@ def hidden_activations(dense, z, normalize=True):
         return h * F.linear(z_n, F.normalize(dense.up_proj.weight, p=2, dim=1))
     h = dense.act_fn(F.linear(z, dense.gate_proj.weight))
     return h * F.linear(z, dense.up_proj.weight)
+
+
+@torch.no_grad()
+def marker_weights(dense, z, k_act=10, normalize=True, batch_chunk=None,
+                   device=None):
+    """印の付いた場所に ``|h|`` を置いた [トークン, ニューロン]。
+
+    ``analyze_activations`` が返す markers は 0/1 で、上位10に入ったかどうか
+    しか残らない。取りこぼす量は活性の**大きさ**で決まるのに、分割規則は
+    その大きさを見ずにクラスタを作っている。その差を埋めたい方式がこれを使う。
+
+    印の位置は markers と同じ（同じ k_act の topk）で、値だけが違う。
+    """
+    step = batch_chunk or z.shape[0]
+    rows = []
+    for start in range(0, z.shape[0], step):
+        chunk = z[start:start + step].to(device) if device is not None else z[start:start + step]
+        h = hidden_activations(dense, chunk, normalize=normalize)
+        rows.append(h.to('cpu'))
+        del h, chunk
+    h = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
+
+    flat = h.reshape(-1, h.shape[-1]).abs().float()
+    weights = torch.zeros_like(flat)
+    for index in range(flat.shape[0]):
+        values, top_indices = torch.topk(flat[index], k=k_act)
+        weights[index, top_indices] = values
+    return weights
+
+
+@torch.no_grad()
+def neuron_mass(dense, z, batch_chunk=None, device=None):
+    """ニューロンごとの ``Σ_t |H_ti|``（真の中間活性、fp32）。
+
+    ``alloc.oracles.mass`` が回収率を測るときの質量と同じものを、ニューロン
+    単位で足したものである。プロファイル用の正規化した h ではなく**真の H**
+    から取る、という ``mass`` 側の規則をここでも守る。
+    """
+    step = batch_chunk or z.shape[0]
+    total = None
+    for start in range(0, z.shape[0], step):
+        chunk = z[start:start + step].to(device) if device is not None else z[start:start + step]
+        h = hidden_activations(dense, chunk, normalize=False)
+        part = h.reshape(-1, h.shape[-1]).abs().to(torch.float32).sum(dim=0).to('cpu')
+        total = part if total is None else total + part
+        del h, chunk, part
+    return total
