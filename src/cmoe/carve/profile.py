@@ -35,6 +35,37 @@ def analyze_activations(scores, k_act=10):
 
 
 @torch.no_grad()
+def select_positions(z, mask):
+    """層の FFN 入力から、印の付いた位置だけを取り出す。
+
+    ``[bsz, seq, hidden]`` を ``[1, 印の数, hidden]`` にする。プロファイルは
+    ``[トークン, ニューロン]`` に潰してから数えるので、系列の形は結果に効か
+    ない。1本にまとめるので ``batch_chunk`` はここでは効かなくなるが、確保の
+    上限は印の数（校正セットが決める採点位置の総量）で抑えられており、絞る
+    前の全位置を数えていたときより小さい。
+
+    ``mask`` が None なら z をそのまま返す（既存のすべての経路がこれで、値も
+    確保も1ビットも変わらない）。
+
+    **絞るのはプロファイルだけである。** 次の層へ渡す出力も、層ローカル指標が
+    読む真の H も、絞っていない z から作る。印が言うのは「どの位置の活性が
+    採点に効くか」であって、「どの位置を走らせるか」ではない。
+    """
+    if mask is None:
+        return z
+    if z.dim() != 3:
+        raise ValueError(f'[bsz, seq, hidden] のはず（{tuple(z.shape)}）')
+    if tuple(mask.shape) != tuple(z.shape[:2]):
+        raise ValueError(
+            f'印は {tuple(mask.shape)}、z は {tuple(z.shape[:2])} — '
+            '校正トークンとこの層の入力が対応していない')
+    flat = z.reshape(-1, z.shape[-1])[mask.reshape(-1).to(z.device)]
+    if flat.shape[0] == 0:
+        raise ValueError('印の付いた位置が1つも無い')
+    return flat.unsqueeze(0)
+
+
+@torch.no_grad()
 def profile_layer(dense, z, k_act=10, normalize=True, batch_chunk=None,
                   device=None):
     """FFN 入力 z から (rates, markers) を作る。バッチを分けても結果は同じ。

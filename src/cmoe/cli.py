@@ -153,6 +153,10 @@ def build_parser():
                      help='方式5 の offset 段を走らせない（gain だけ合わせる）')
     run.add_argument('--max-sweeps', type=int, default=10,
                      help='方式4 の座標上昇の掃引上限')
+    run.add_argument('--profile-positions', default='all',
+                     choices=('all', 'scored'),
+                     help='活性を数える位置。scored は、選択肢の対数尤度を'
+                          '作っている位置だけを数える（印を持つ校正セットが要る）')
     run.add_argument('--no-profiling-norm', action='store_true')
     run.add_argument('--no-router-norm', action='store_true')
     run.add_argument('--layers', type=int, default=None,
@@ -224,6 +228,15 @@ def add_oracle_arguments(parser, layers_help):
                         help='系列を分ける幅。n が大きいときだけ要る')
     parser.add_argument('--token-chunk', type=int, default=None,
                         help='オラクルがトークンを分ける幅')
+    parser.add_argument('--profile-positions', default='all',
+                     choices=('all', 'scored'),
+                     help='活性を数える位置。scored は、選択肢の対数尤度を'
+                          '作っている位置だけを数える（印を持つ校正セットが要る）')
+    parser.add_argument('--scored-weight', type=float, default=None,
+                        help='オラクルの目的関数で、答え部分が占める重みの割合'
+                             '（0〜1）。1 で答え部分だけ、0 で文脈だけ。省略時は'
+                             '実位置を等しく数える（埋めは常に 0）。印を持つ'
+                             '校正セットが要る')
     parser.add_argument('--no-profiling-norm', action='store_true')
     parser.add_argument('--no-router-norm', action='store_true')
     parser.add_argument('--layers', type=int, default=None, help=layers_help)
@@ -308,6 +321,7 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
         fit_batch_chunk=args.fit_batch_chunk,
         token_chunk=args.token_chunk,
         n_layers=args.layers,
+        scored_positions_only=args.profile_positions == 'scored',
         log=lambda message: None,
     )
     started = time.time()
@@ -724,6 +738,8 @@ def build_walk(args, adapter, calibration):
     オラクルは分割規則もルーター方式も知らないまま、候補の層を測れる。
     """
     inputs = adapter.capture_layer_inputs(calibration.input_ids)
+    profile_mask = scored_mask(args, calibration)
+    weights = score_weights(args, calibration)
     factory = layer_factory(
         create_carver(args.carver, args.nexperts, k_act=args.k_act),
         args.nexperts,
@@ -732,7 +748,45 @@ def build_walk(args, adapter, calibration):
     return LayerWalk(
         adapter, inputs, factory, args.nexperts,
         n_active_total=args.nactive, k_act=args.k_act,
-        profiling_norm=not args.no_profiling_norm, batch_chunk=args.batch_chunk)
+        profiling_norm=not args.no_profiling_norm, batch_chunk=args.batch_chunk,
+        profile_mask=profile_mask, score_weights=weights)
+
+
+def scored_mask(args, calibration):
+    """``--profile-positions`` が言う、活性を数える位置。絞らないなら None。
+
+    ``Converter._profile_mask`` と同じ判断を、探索の側でも同じように断る。
+    """
+    if args.profile_positions != 'scored':
+        return None
+    mask = calibration.scored_mask()
+    if mask is None:
+        raise SystemExit(
+            f'{calibration.name} は採点位置の印を持たない。'
+            '--profile-positions scored には印を持つ校正セット（benchqa）が要る')
+    return mask
+
+
+def score_weights(args, calibration):
+    """オラクルが位置ごとに掛ける重み。印を持たないセットでは None。
+
+    ``--profile-positions`` とは別の軸である。あちらが決めるのは分割を作る統計を
+    どの位置から取るかで、こちらが決めるのは候補をどの位置で採点するかである。
+
+    印を持つセットでは、``--scored-weight`` を渡さなくても**埋めは 0 になる**。
+    埋めの位置の読み出しは意味を持たないので、数えないのが既定側である。
+    """
+    if args.scored_weight is not None and calibration.scored_mask() is None:
+        raise SystemExit(
+            f'{calibration.name} は採点位置の印を持たない。'
+            '--scored-weight には印を持つ校正セット（benchqa）が要る')
+    weights = calibration.position_weights(args.scored_weight)
+    if weights is not None:
+        share = ('実位置を等しく' if args.scored_weight is None
+                 else f'{args.scored_weight:.3f}')
+        log(f'  採点する位置: {int((weights > 0).sum())} / {weights.numel()}'
+            f'（答え部分の重み {share}）')
+    return weights
 
 
 def check_search_arguments(args):
@@ -749,6 +803,8 @@ def check_search_arguments(args):
 def check_oracle_arguments(args):
     """``search`` と ``score`` に共通の、オラクルまわりの引数検査。"""
     check_oracle(args.oracle)
+    if args.scored_weight is not None and not 0.0 <= args.scored_weight <= 1.0:
+        raise SystemExit(f'--scored-weight は 0..1（{args.scored_weight}）')
     if args.layers is not None and args.layers < 1:
         # `args.layers or n_layers` は 0 を falsy として全層に化かす。配線確認の
         # つもりの --layers 0 で本番が始まる

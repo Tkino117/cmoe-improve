@@ -28,7 +28,7 @@ import torch.nn as nn
 
 from cmoe.alloc.oracles.base import CarvedLayer
 from cmoe.carve.base import build_experts
-from cmoe.carve.profile import profile_layer
+from cmoe.carve.profile import profile_layer, select_positions
 from cmoe.moe.modules import MoE, forward_chunked
 from cmoe.router.base import (build_baseline_router, build_router, make_context,
                               router_representative_indices)
@@ -164,7 +164,8 @@ class Converter:
     def __init__(self, adapter, carver, router_methods, n_experts,
                  k_act=10, bias_speed=0.001, profiling_norm=True,
                  router_norm=True, batch_chunk=None, fit_batch_chunk=4,
-                 token_chunk=4096, n_layers=None, log=None):
+                 token_chunk=4096, n_layers=None, scored_positions_only=False,
+                 log=None):
         self.adapter = adapter
         self.carver = carver
         # 先頭が層に載る方式であり、次層への伝播もこれで行う
@@ -182,6 +183,9 @@ class Converter:
         self.token_chunk = token_chunk
         # 先頭 n_layers 層だけを変換する。動作確認用で、残りは dense のまま
         self.n_layers = n_layers
+        # 活性を数える位置を、採点に効く位置だけに絞る。校正セットが印
+        # （``TokenSet.segments``）を持っているときにしか立てられない
+        self.scored_positions_only = scored_positions_only
         self.log = log or (lambda message='': None)
 
     @property
@@ -201,6 +205,8 @@ class Converter:
         if self.needs_fit and fit is None:
             raise ValueError(
                 'このルーター方式は fit データを要求する（--calib の分割を渡す）')
+
+        profile_mask = self._profile_mask(carve)
 
         started = time.time()
         carve_inputs = adapter.capture_layer_inputs(carve.input_ids)
@@ -233,8 +239,11 @@ class Converter:
                 index, hidden, carve_inputs.attention_mask,
                 carve_inputs.position_ids, batch_chunk=self.batch_chunk)
 
-            rates, markers = self._profile(dense, z)
-            partition = self.carver.carve(dense, rates, markers, n_shared, z=z)
+            # 分割が読むのはここだけ。次層への伝播は絞っていない z で行う
+            profile_z = select_positions(z, profile_mask)
+            rates, markers = self._profile(dense, profile_z)
+            partition = self.carver.carve(dense, rates, markers, n_shared,
+                                          z=profile_z)
             baseline = build_baseline_router(
                 dense, partition, topk, bias_speed=self.bias_speed,
                 normalize=self.router_norm)
@@ -279,12 +288,29 @@ class Converter:
             report.layers.append(record)
             self.log(self._layer_line(record))
 
-            del (dense, z, residual, rates, markers, partition, baseline,
-                 fit_z, fit_residual, validation_z, validation_residual, routers)
+            del (dense, z, profile_z, residual, rates, markers, partition,
+                 baseline, fit_z, fit_residual, validation_z,
+                 validation_residual, routers)
             torch.cuda.empty_cache()
 
         report.seconds = time.time() - started
         return report
+
+    def _profile_mask(self, carve):
+        """活性を数える位置。絞らないときは None。
+
+        絞れと言われたのに校正セットが印を持たないのは、素の文章のセットを
+        1問1系列の設定で走らせているということなので、黙って全位置に落とさず
+        断る。
+        """
+        if not self.scored_positions_only:
+            return None
+        mask = carve.scored_mask()
+        if mask is None:
+            raise ValueError(
+                f'{carve.name} は採点位置の印を持たない。'
+                '印を持つ校正セット（benchqa）を使うこと')
+        return mask
 
     def _layer_line(self, record):
         line = (f'層 {record.layer:>2}: x={record.n_shared} Top-K={record.topk}')

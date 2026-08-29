@@ -94,11 +94,17 @@ class ModelAdapter(Protocol):
     def forward_layer(self, index, hidden, attention_mask, position_ids):
         """層 index を丸ごと進める。"""
 
-    def forward_suffix(self, start_layer, hidden, inputs, batch_chunk=None):
+    def forward_suffix(self, start_layer, hidden, inputs, batch_chunk=None,
+                       keep=None):
         """層 start_layer 以降を走らせて logits にする。
 
         ``start_layer == n_layers`` は空の suffix（最終段だけ）。層の呼び出し
         規約もバッチの切り方もモデルごとの事情なので、上位はこれ1つで済ませる。
+
+        ``keep``（[bsz, seq] の bool）を渡すと、印の付いた位置の読み出しだけを
+        [位置, 語彙] で返す。捨てる位置の logits を一度も並べないための引数で
+        ある — [bsz, seq, 語彙] は語彙ぶんの幅があり、読まない位置まで持つと
+        そこが一番大きい確保になる。
         """
 
     def head(self, hidden: torch.Tensor) -> torch.Tensor:

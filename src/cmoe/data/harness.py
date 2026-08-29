@@ -109,9 +109,20 @@ def render_document(task, doc):
     WinoGrande（``multiple_input``）は選択肢が文脈の側に立つので、正解の文脈に
     共通の続きを足す形になる。
     """
+    context, continuation = render_parts(task, doc)
+    return context + continuation
+
+
+def render_parts(task, doc):
+    """同じ1問を、切れ目を残したまま (文脈, 続き) に分ける。
+
+    繋ぐと ``render_document`` と1文字も違わない。1問1系列で引くセットは、
+    lm-eval が採点する続きがどこから始まるかを知る必要があるので、こちらを
+    読む。切れ目の定義がここ1箇所にしか無いことが要点である。
+    """
     choices = task.doc_to_choice(doc)
     index = gold_index(task, doc, len(choices))
     delimiter = task.config.target_delimiter
     if getattr(task, 'multiple_input', 0):
-        return choices[index] + delimiter + task.doc_to_target(doc)
-    return task.doc_to_text(doc) + delimiter + choices[index]
+        return choices[index], delimiter + task.doc_to_target(doc)
+    return task.doc_to_text(doc), delimiter + choices[index]

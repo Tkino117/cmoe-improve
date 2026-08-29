@@ -26,7 +26,7 @@ shared のニューロンと、ルーターが選んだ routed expert のニュ�
 import torch
 
 from cmoe.alloc.base import ScoreResult
-from cmoe.alloc.oracles.base import PrefixOracleBase
+from cmoe.alloc.oracles.base import PrefixOracleBase, apply_weights
 
 
 def group_mass(h, groups, squared=False):
@@ -121,8 +121,11 @@ def selected_mask(routed_mass, indices):
 
 @torch.no_grad()
 def recovered_mass(h, partition, indices, squared=False, token_chunk=None,
-                   device=None):
+                   device=None, weights=None):
     """(R, 内訳)。h は [トークン, ニューロン] の真の H。
+
+    ``weights`` を渡すと、位置ごとの質量にその重みを掛けてから比を取る（分子も
+    分母も同じ重みで、割合であることは保たれる）。渡さなければ全位置が等しい。
 
     バッチを分けているとき h はホストに残る。層ローカル誤差と同じく、計算は
     重みが載っている側で塊ごとに回し、トークンごとの和だけを戻す。和はトークン
@@ -148,6 +151,12 @@ def recovered_mass(h, partition, indices, squared=False, token_chunk=None,
     selected = torch.cat(selected_rows) if len(selected_rows) > 1 else selected_rows[0]
     per_token_total = torch.cat(total_rows) if len(total_rows) > 1 else total_rows[0]
     per_token_recovered = shared + selected
+    # 重みは最後に1回だけ掛ける。塊ごとの和はトークンで閉じているので、掛ける
+    # 場所を後ろへ寄せても値は変わらない
+    shared = apply_weights(shared, weights)
+    selected = apply_weights(selected, weights)
+    per_token_recovered = apply_weights(per_token_recovered, weights)
+    per_token_total = apply_weights(per_token_total, weights)
     total = float(per_token_total.sum())
     # `not (x > 0)` と書くのは、NaN があらゆる比較に失敗するからである。NaN の
     # まま通すと、候補の大小比較が当たり外れで決まる
@@ -160,7 +169,7 @@ def recovered_mass(h, partition, indices, squared=False, token_chunk=None,
         'shared_mass': float(shared.sum()),
         'selected_routed_mass': float(selected.sum()),
         'total_mass': total,
-        'n_tokens': int(h.shape[0]),
+        'n_tokens': int(h.shape[0] if weights is None else (weights > 0).sum()),
     }
 
 
@@ -197,7 +206,8 @@ class MassOracle(PrefixOracleBase):
                 f'ルーターが {indices.shape[0]} 行を返した（トークンは '
                 f'{h.shape[0]} 個）')
         r, details = recovered_mass(h, carved.partition, indices, self.squared,
-                                    self.token_chunk, device)
+                                    self.token_chunk, device,
+                                    self.walk.flat_score_weights())
         details.update({'r': r, 'missed': 1.0 - r, 'layer': profile.layer,
                         'x': carved.n_shared, 'topk': carved.topk,
                         'squared': self.squared})

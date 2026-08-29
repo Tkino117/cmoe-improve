@@ -36,7 +36,7 @@ import weakref
 import torch
 
 from cmoe.alloc.base import ScoreResult
-from cmoe.alloc.oracles.base import PrefixOracleBase
+from cmoe.alloc.oracles.base import PrefixOracleBase, apply_weights
 from cmoe.alloc.oracles.mass import neuron_to_expert, router_selection
 
 # 行列積1回あたりのトークン数。マスク後の H は fp32 なので、7B 規模
@@ -178,6 +178,12 @@ class LocalErrorOracle(PrefixOracleBase):
                                              self.token_chunk, device)
         del w32
 
+        # 重みは掛け算1回ぶん後ろに置く。分母のキャッシュ（層の候補で共有する）
+        # は重みを掛ける前のもので、掛ける相手は候補ごとに同じである
+        weights = self.walk.flat_score_weights()
+        per_token_total = apply_weights(per_token_total, weights)
+        per_token_missed = apply_weights(per_token_missed, weights)
+
         total = float(per_token_total.sum())
         if not total > 0:
             raise ValueError(f'dense FFN 出力の二乗ノルムが {total}。H が空か非有限')
@@ -196,6 +202,8 @@ class LocalErrorOracle(PrefixOracleBase):
             score=state.score + value, cost=1.0, cost_unit=self.cost_unit,
             details={'l': value, 'over_unity': over_unity,
                      'missed_energy': float(per_token_missed.sum()),
-                     'total_energy': total, 'n_tokens': n_tokens,
+                     'total_energy': total,
+                     'n_tokens': (n_tokens if weights is None
+                                  else int((weights > 0).sum())),
                      'layer': profile.layer, 'x': carved.n_shared,
                      'topk': carved.topk})

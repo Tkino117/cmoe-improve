@@ -42,7 +42,8 @@ from typing import Protocol
 import torch
 
 from cmoe.alloc.base import ScoreResult
-from cmoe.carve.profile import hidden_activations, profile_layer
+from cmoe.carve.profile import (hidden_activations, profile_layer,
+                                select_positions)
 from cmoe.moe.modules import forward_chunked
 
 
@@ -100,6 +101,9 @@ class LayerProfile:
     residual: object
     rates: object
     markers: object
+    # 活性を数えた位置だけを取り出した z。絞らないときは z そのもの。分割規則
+    # は統計と同じ位置を見なければならないので、分割へ渡すのはこちらである
+    profile_z: object = None
     h_true: object = field(default=None, repr=False)
 
 
@@ -112,7 +116,8 @@ class LayerWalk:
 
     def __init__(self, adapter, inputs, layer_factory, n_experts,
                  n_active_total=6, k_act=10, profiling_norm=True,
-                 batch_chunk=None, state_device='cpu'):
+                 batch_chunk=None, state_device='cpu', profile_mask=None,
+                 score_weights=None):
         self.adapter = adapter
         self.inputs = inputs
         self.layer_factory = layer_factory
@@ -122,6 +127,25 @@ class LayerWalk:
         self.profiling_norm = profiling_norm
         self.batch_chunk = batch_chunk
         self.state_device = torch.device(state_device)
+        # 活性を数える位置（``TokenSet.scored_mask()``）。None なら全位置。
+        # 組み立て役と同じものを渡さないと、探索が測った分割とあとで載る分割が
+        # 別物になる
+        self.profile_mask = profile_mask
+        # オラクルが位置ごとに掛ける重み（``TokenSet.position_weights()``）。
+        # None なら全位置が等しい。**分割を決める ``profile_mask`` とは別物で
+        # ある** — こちらが決めるのは「候補をどの位置で採点するか」であって、
+        # 「どの位置の活性でニューロンを切り分けるか」ではない。2つを別々に
+        # 動かせることが、形の効果と位置の効果を分ける実験点になる
+        self.score_weights = score_weights
+        if score_weights is not None:
+            expected = tuple(inputs.hidden.shape[:2])
+            if tuple(score_weights.shape) != expected:
+                raise ValueError(
+                    f'重みは {tuple(score_weights.shape)}、校正入力は '
+                    f'{expected} — 対応していない')
+            if not float(score_weights.sum()) > 0:
+                raise ValueError('重みが全位置で 0。採点する位置が無い')
+        self._flat_weights = None
         # 1接頭辞 × 1層ぶんだけ持つ。beam は1つの親の子を続けて測るので、
         # これで捕捉と統計は層ごとに1回になる。親の状態への参照を握っている
         # あいだは、その状態が解放されないことも保証される。
@@ -134,6 +158,19 @@ class LayerWalk:
     @property
     def device(self):
         return self.adapter.device
+
+    def flat_score_weights(self):
+        """重みを [トークン] に潰したもの。重みが無ければ None。
+
+        位置ごとの量（層ローカル指標のトークンごとの和、KL のトークンごとの値）
+        は、どれも ``reshape(-1)`` と同じ並びで出てくる。並べ替えの規則が1つ
+        しかないことが、重みとトークンの対応が崩れない理由である。
+        """
+        if self.score_weights is None:
+            return None
+        if self._flat_weights is None:
+            self._flat_weights = self.score_weights.reshape(-1)
+        return self._flat_weights
 
     def candidates(self, layer):
         """その層で試せる x。
@@ -194,11 +231,13 @@ class LayerWalk:
             layer, hidden, self.inputs.attention_mask,
             self.inputs.position_ids, batch_chunk=self.batch_chunk)
         del hidden
+        profile_z = select_positions(z, self.profile_mask)
         rates, markers = profile_layer(
-            dense, z, k_act=self.k_act, normalize=self.profiling_norm,
+            dense, profile_z, k_act=self.k_act, normalize=self.profiling_norm,
             batch_chunk=self.batch_chunk, device=self.device)
         profile = LayerProfile(layer=layer, dense=dense, z=z, residual=residual,
-                               rates=rates, markers=markers)
+                               rates=rates, markers=markers,
+                               profile_z=profile_z)
         self._cache = (state, layer, profile)
         return profile
 
@@ -210,7 +249,8 @@ class LayerWalk:
                 f'x={x} は層 {profile.layer} の候補 '
                 f'{self.candidates(profile.layer)} に無い')
         carved = self.layer_factory(profile.dense, profile.rates, profile.markers,
-                                    x, self.n_active_total - x, z=profile.z)
+                                    x, self.n_active_total - x,
+                                    z=profile.profile_z)
         if carved.n_shared != x or carved.topk != self.n_active_total - x:
             raise ValueError(
                 f'x={x} を渡したのに x={carved.n_shared} Top-K={carved.topk} '
@@ -251,6 +291,21 @@ class LayerWalk:
         h = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
         profile.h_true = h.reshape(-1, h.shape[-1])
         return profile.h_true
+
+
+def apply_weights(per_token, weights):
+    """位置ごとの量に、オラクルの重みを掛ける。重みが無ければそのまま返す。
+
+    重みが無い経路では引数のテンソルをそのまま返す（掛け算も確保もしない）ので、
+    既存の測定の数は1ビットも動かない。
+    """
+    if weights is None:
+        return per_token
+    if weights.shape[0] != per_token.shape[0]:
+        raise ValueError(
+            f'重みは {weights.shape[0]} 位置、測ったのは {per_token.shape[0]} '
+            'トークン — 対応していない')
+    return per_token * weights.to(dtype=per_token.dtype, device=per_token.device)
 
 
 class PrefixOracleBase:

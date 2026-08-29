@@ -4,7 +4,7 @@
 評価にしか使わないもの（c4-new）、carve にしか使わないものが今後も出るため。
 """
 
-from cmoe.data import benchtrain, c4, flanv2, slimpajama, wikitext2
+from cmoe.data import benchqa, benchtrain, c4, flanv2, slimpajama, wikitext2
 
 def _benchtrain_subset(label, tasks):
     """一部のタスクだけで引く benchtrain。本数は変えない（n_samples 本を配る）。
@@ -16,6 +16,14 @@ def _benchtrain_subset(label, tasks):
     def loader(model, seqlen, n_samples, seed):
         return benchtrain.calibration(model, seqlen, n_samples, seed,
                                       name=f'benchtrain-{label}', tasks=tasks)
+    return loader
+
+
+def _benchqa_subset(label, tasks):
+    """一部のタスクだけで引く benchqa。採点位置の総量は変えない。"""
+    def loader(model, seqlen, n_samples, seed):
+        return benchqa.calibration(model, seqlen, n_samples, seed,
+                                   name=f'benchqa-{label}', tasks=tasks)
     return loader
 
 
@@ -33,6 +41,12 @@ CALIBRATION_SETS = {
     'benchtrain:arc': _benchtrain_subset('arc', ('arc_easy', 'arc_challenge')),
     # ExpertWeaver の多タスク校正（Flan、36タスク）を同じ量で写したもの
     'flanv2': flanv2.calibration,
+    # 同じ train split を1問1系列で引き、採点に効く位置に印を付けたもの。
+    # 印を使うかどうかは読む側（``--profile-positions``）が決める
+    'benchqa': benchqa.calibration,
+    **{f'benchqa:{task}': _benchqa_subset(task, (task,))
+       for task in benchtrain.TASKS},
+    'benchqa:arc': _benchqa_subset('arc', ('arc_easy', 'arc_challenge')),
 }
 
 # ルーター方式が要る carve / fit / validation の3本組。

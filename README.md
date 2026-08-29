@@ -29,6 +29,13 @@ uv run cmoe search --oracle suffix_kl --search beam --width 4
 # 安い層ローカル指標で探す（後続の層を走らせない）
 uv run cmoe search --oracle local_error --search greedy --width 1
 
+# 校正を1問1系列で引き、採点に効く位置だけで活性を数える
+uv run cmoe run --calib benchqa --profile-positions scored --alloc uniform4 --bench
+
+# 探索の目的関数でも答え部分だけを見る（--scored-weight 1 で答え部分が全部）
+uv run cmoe search --calib benchqa --profile-positions scored \
+    --scored-weight 1.0 --search beam --width 2
+
 # 探索を走らせず、与えた配分を同じオラクルで採点する。対照の一様配分を
 # 「評価指標を見て選ぶ」のではなく、探索と同じ目的関数で選ぶのに使う
 uv run cmoe score --oracle suffix_kl --alloc uniform3 --alloc uniform4
@@ -73,7 +80,9 @@ tests/        CPU で数秒で回る動作確認
 
 - 校正セット: `wikitext2`、`c4`、`slimpajama`（SlimPajama の7成分を層化して引く。
   成分ごとの本数を固定するので、seed を振っても組成が変わらない）、`benchtrain`
-  （選択問題5タスクの train split を層化して引く。評価に使う split は入らない）
+  （選択問題5タスクの train split を層化して引く。評価に使う split は入らない）、
+  `benchqa`（同じ train split を**1問1系列**で引き、採点される対数尤度を作って
+  いる位置に印を付ける。印を使うかは `--profile-positions` が決める）
 - アダプタ: `llama`（既存の測定を再現する経路）、`auto`（同じ層構造の他モデル）
 - ルーター方式: 現行 CMoE、頻度重心、Oracle 相関、回収率の共同最適化、
   score 校正（代表を凍結し expert ごとの gain と offset を座標上昇で合わせる）、
@@ -81,6 +90,12 @@ tests/        CPU で数秒で回る動作確認
 - ルーター診断: `|h|` 回収率、Oracle gap 回収率、Top-K の recall と完全一致率
 - 採点オラクル: `mass`（活性質量の回収率）、`mass_squared`、`local_error`（層の
   出力誤差 L）、`suffix_kl`（残りを dense のまま走らせた出力分布の KL）
+- 活性を数える位置: 全位置（既定）と、採点される対数尤度を作っている位置だけ
+  （`--profile-positions scored`。印を持つ校正セットが要る）
+- オラクルが採点する位置: `--scored-weight` が、目的関数のうち答え部分が占める
+  割合を決める（1 で答え部分だけ、0 で文脈だけ）。省略しても、印を持つ校正
+  セットでは埋めを数えない。分割を決める `--profile-positions` とは別の軸で、
+  「どの位置で切り分けるか」と「どの位置で採点するか」を別々に動かせる
 - 配分の探索: `beam`（幅を指定）、`greedy`（幅1のビームそのもの）。探索を
   走らせずに配分を採点するだけの `cmoe score` もある（対照を校正で選ぶため）
 - 評価: PPL と、選択問題ベンチマーク5タスク（`--bench`）
