@@ -312,3 +312,95 @@ def test_argument_errors_surface_before_the_model_is_loaded():
 def test_a_search_without_an_oracle_is_refused():
     with pytest.raises(ValueError, match='オラクルを要求'):
         create_search('beam', width=2).search(None, 2)
+
+
+# -- 深さ（先読み） ----------------------------------------------------------
+
+def test_lookahead_zero_is_the_beam_itself():
+    """深さ0 は既定のビームと1つも違わない。既存の測定すべての対照がここにある。"""
+    plain = create_search('beam', width=2)
+    deep = create_search('beam', width=2, lookahead=0)
+    left = plain.search(FakeOracle(), 2)
+    right = deep.search(FakeOracle(), 2)
+    assert left.values == right.values
+    assert left.name == right.name == 'beam2'
+    assert ([row['beam'] for row in plain.records]
+            == [row['beam'] for row in deep.records])
+
+
+def test_lookahead_finds_what_width_finds():
+    """TRAP は幅2 で解ける盤面だが、幅1 でも1層先を見れば解ける。
+
+    層0 の x=0 はその場では見劣りする（1.0）。次の層まで展開すると 0.1 に届く
+    ことが分かり、幅を増やさずに残る。幅と深さが別の軸であることの実演である。
+    """
+    assert create_search('greedy', lookahead=1).search(FakeOracle(), 2).values == (0, 0)
+    # 深さを外せば、同じ幅・同じ盤面で取り逃がす
+    assert create_search('greedy').search(FakeOracle(), 2).values == (1, 0)
+
+
+def test_the_last_layer_ranks_on_its_own_score():
+    """最終層には先が無いので、順位はその接頭辞自身のスコアで付く。
+
+    探索が返す score（CLI は最終層のビーム先頭から取る）が接頭辞そのものの値で
+    あるために要る。ここが先読みの値だと、測り直しと突き合わない。
+    """
+    search = create_search('greedy', lookahead=1)
+    allocation = search.search(FakeOracle(), 2)
+    assert search.records[-1]['beam'][0]['score'] == pytest.approx(
+        TRAP[tuple(allocation.values)])
+
+
+def test_the_record_keeps_the_child_score_and_the_ranked_score():
+    search = create_search('greedy', lookahead=1)
+    search.search(FakeOracle(), 2)
+    children = search.records[0]['rows'][0]['children']
+    assert search.records[0]['lookahead'] == 1
+    first = children[0]
+    assert first['score'] == pytest.approx(TRAP[(0,)])          # 子自身
+    assert first['ranked_score'] == pytest.approx(0.1)          # 先読みの最良
+    assert [row['score'] for row in first['lookahead']] == [0.1, 0.4, 0.7]
+    # 最終層は先読みを持たない
+    assert 'ranked_score' not in search.records[1]['rows'][0]['children'][0]
+
+
+def test_every_lookahead_state_is_handed_back():
+    """先読みで作った状態も、その場で全部返す。
+
+    先読みは同じ接頭辞を2度作る（1度目は順位付けのため、2度目は本番の展開）。
+    重複は深さの代金であって漏れではないので、ここでは重複ではなく**総数**を見る。
+    """
+    oracle = FakeOracle()
+    create_search('greedy', lookahead=1).search(oracle, 2)
+    # 根1 + 層0 の子3 + その先読み 3×3 + 層1 の子3
+    assert len(oracle.released) == 1 + 3 + 9 + 3
+    assert oracle.calls == 3 + 9 + 3
+
+
+def test_the_allocation_name_says_the_depth():
+    assert create_search('beam', width=2, lookahead=1).allocation_name() == 'beam2L1'
+    assert create_search('greedy', lookahead=1).allocation_name() == 'greedyL1'
+    assert create_search('beam', width=2).allocation_name() == 'beam2'
+
+
+def test_a_negative_depth_is_refused():
+    from cmoe.alloc.search.registry import check_search
+
+    with pytest.raises(ValueError, match='lookahead'):
+        create_search('beam', width=2, lookahead=-1)
+    with pytest.raises(ValueError, match='lookahead'):
+        check_search('beam', 2, -1)
+
+
+def test_a_failing_lookahead_does_not_strand_the_states():
+    class Failing(FakeOracle):
+        def extend(self, state, layer, x):
+            if layer == 1 and len(state) == 1 and state[0] == 1:
+                raise RuntimeError('先読みで落ちた')
+            return super().extend(state, layer, x)
+
+    oracle = Failing()
+    with pytest.raises(RuntimeError, match='先読みで落ちた'):
+        create_search('beam', width=2, lookahead=1).search(oracle, 2)
+    # 先読みに入る前の子（0,）も、根も、落ちた時点で手放している
+    assert () in oracle.released and (0,) in oracle.released and (1,) in oracle.released

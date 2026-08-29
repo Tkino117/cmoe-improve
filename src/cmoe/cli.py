@@ -190,6 +190,10 @@ def build_parser():
     search.add_argument('--width', type=int, default=None,
                         help='各層で生き残る接頭辞の本数。省略時は探索ごとの既定'
                              '（beam は4、greedy は1）')
+    search.add_argument('--lookahead', type=int, default=0,
+                        help='刈る前に何層先まで展開するか。0（既定）は現行の'
+                             'ビーム。1 にすると子ごとに次の層を全候補展開し、'
+                             'その最良で順位を付ける（採点回数が候補数倍になる）')
     search.add_argument('--budget', type=float, default=None,
                         help='オラクルのコスト上限。単位はオラクルが決める')
     search.add_argument('--no-recheck', action='store_true',
@@ -796,7 +800,7 @@ def check_search_arguments(args):
     runlog が「終わった結果がある場所」を先に拒むのと同じ理由で、断れるものは
     測る前に断る。
     """
-    check_search(args.search, args.width)
+    check_search(args.search, args.width, args.lookahead)
     check_oracle_arguments(args)
 
 
@@ -826,7 +830,9 @@ def command_search(args):
     adapter_name = args.adapter or guess_adapter(args.model)
     log(f'model={args.model} carve={args.calib} n={args.nsamples} seed={args.seed} '
         f'N={args.nexperts} A={args.nactive}')
-    log(f'探索 {args.search}(幅 {args.width or "既定"}) × オラクル {args.oracle}')
+    depth = f' 深さ {args.lookahead}' if args.lookahead else ''
+    log(f'探索 {args.search}(幅 {args.width or "既定"}{depth}) '
+        f'× オラクル {args.oracle}')
     log(f'出力 {out}')
 
     adapter = create_adapter(adapter_name, args.model, seqlen=args.seqlen)
@@ -852,7 +858,7 @@ def command_search(args):
         'n_layers': n_layers,
         'oracle': {'name': oracle.name, 'cost_unit': oracle.cost_unit},
         'search': {'name': args.search, 'width': args.width,
-                   'budget': args.budget},
+                   'lookahead': args.lookahead, 'budget': args.budget},
         'calibration': calibration.metadata(),
         'layers': [],
     }
@@ -872,7 +878,8 @@ def command_search(args):
 
     search = create_search(args.search, width=args.width,
                            n_active_total=args.nactive, budget=args.budget,
-                           log=log, on_layer=on_layer)
+                           log=log, on_layer=on_layer,
+                           lookahead=args.lookahead)
     log()
     started = time.time()
     try:

@@ -6,6 +6,12 @@ CMoE-ref の ``xsearch/beam.py`` と ``scripts/beam_search.py`` の探索部分�
 層4以降に何も残さない選択でありうるし、1本しか持たない歩き方はそれに気づけない。
 ここでは B 本を残すので、2番手に見えた層が、後続の層に評価されるまで生き延びる。
 
+**幅と深さは別の軸である。** 幅 B は「同じ層で何本残すか」、深さ（``lookahead``）は
+「刈る前に何層先まで展開するか」である。既定の深さ0 では、層 ℓ の子はその場の
+スコアだけで順位が付く — 層 ℓ の選択が層 ℓ+1 に何を残すかは、刈ったあとにしか
+分からない。深さ1 では子ごとに次の層の候補を全部展開し、**その最良**を子の順位に
+使う。``lookahead=0`` は既定のビームそのもので、同じコードが走る。
+
 **B = 1 が貪欲な歩き方である。** 幅1のビームでは各層の生存者が親の候補の argmin
 になり、それは貪欲そのものである。特別扱いではなく退化した場合で、同じコードが
 走る。「ビームが貪欲では見つからないものを見つけた」が、2本のスクリプトの違い
@@ -190,10 +196,15 @@ class BeamSearch:
     name = 'beam'
 
     def __init__(self, width=4, n_active_total=N_ACTIVE, budget=None, log=None,
-                 on_layer=None):
+                 on_layer=None, lookahead=0):
         if not width >= 1:
             raise ValueError(f'--width は 1 以上（{width}）')
+        if not lookahead >= 0:
+            raise ValueError(f'--lookahead は 0 以上（{lookahead}）')
         self.width = width
+        # 刈る前に何層先まで展開するか。0 は現行のビーム。子1つあたりの採点回数が
+        # 候補数の lookahead 乗で増える（候補7・深さ1 なら1つの子につき7回）
+        self.lookahead = lookahead
         self.n_active_total = n_active_total
         self.budget = budget
         self.log = log or (lambda message='': None)
@@ -201,7 +212,10 @@ class BeamSearch:
         self.records = []
 
     def allocation_name(self):
-        return f'{self.name}{self.width}'
+        return f'{self.name}{self.width}{self._depth_suffix()}'
+
+    def _depth_suffix(self):
+        return f'L{self.lookahead}' if self.lookahead else ''
 
     def search(self, oracle, n_layers):
         """層 0..n_layers-1 を決めて、最良の配分を返す。"""
@@ -218,7 +232,8 @@ class BeamSearch:
         try:
             for layer in range(n_layers):
                 self._check_budget(oracle, best)
-                entries, record = self._walk_layer(oracle, layer, entries)
+                entries, record = self._walk_layer(oracle, layer, entries,
+                                                   n_layers)
                 best = entries[0]
                 self.records.append(record)
                 if self.on_layer is not None:
@@ -254,8 +269,12 @@ class BeamSearch:
             f'{len(best.allocation)} 層',
             prefix=best.allocation, spent=oracle.spent, budget=self.budget)
 
-    def _walk_layer(self, oracle, layer, parents):
-        """親ビームの全員をこの層で展開し、次のビームを返す。"""
+    def _walk_layer(self, oracle, layer, parents, n_layers):
+        """親ビームの全員をこの層で展開し、次のビームを返す。
+
+        深さが 0 でないときは、子を1つ作るたびにその先を展開して**先の最良**を
+        取り、それを子の順位に使う。子自身のスコアは記録には残るが、順位は決めない。
+        """
         def evict(entry):
             oracle.release(entry.payload)
             entry.payload = None
@@ -267,10 +286,23 @@ class BeamSearch:
                 row = []
                 for x in oracle.candidates(layer):
                     result, child_state = oracle.extend(parent.payload, layer, x)
-                    row.append({'x': x, 'score': result.score,
-                                'details': result.details})
+                    try:
+                        ahead, ahead_rows = self._look_ahead(
+                            oracle, layer, child_state, n_layers, self.lookahead)
+                    except BaseException:
+                        # まだビームに入れていない子は、この層の後始末からは
+                        # 見えない。作った側で捨てる
+                        oracle.release(child_state)
+                        raise
+                    ranked = result.score if ahead is None else ahead
+                    entry = {'x': x, 'score': result.score,
+                             'details': result.details}
+                    if ahead is not None:
+                        entry['ranked_score'] = ahead
+                        entry['lookahead'] = ahead_rows
+                    row.append(entry)
                     evicted = collector.insert(
-                        parent.extend(x, result.score, payload=child_state))
+                        parent.extend(x, ranked, payload=child_state))
                     if evicted is not None:
                         dropped.append(evicted.score)
                 # 親の状態はここで手放す。展開済みの接頭辞は子が引き継いでいる
@@ -295,6 +327,7 @@ class BeamSearch:
 
         record = {
             'layer': layer,
+            'lookahead': self.lookahead,
             'rows': rows,
             'beam': [{'rank': rank, 'parent': parent, 'x': entry.x,
                       'score': entry.score, 'allocation': list(entry.allocation)}
@@ -308,6 +341,32 @@ class BeamSearch:
         self._log_layer(record)
         return entries, record
 
+    def _look_ahead(self, oracle, layer, state, n_layers, depth):
+        """``state`` から先を ``depth`` 層ぶん展開し、(最良のスコア, 内訳) を返す。
+
+        先の層で作った状態はここで全部手放す。持ち帰るのは数だけである — 先読みは
+        「この子を残すか」を決めるためのもので、先の層はあとで本番の展開が
+        もう一度通るからである（そのぶん採点は重複する。深さの代金はここに出る）。
+
+        展開する層が残っていないとき（最終層の子）は ``(None, None)`` を返し、
+        呼び出し側は子自身のスコアで順位を付ける。最終層の順位が子自身のスコアで
+        付くことは、探索が返す score が接頭辞そのものの値であるために要る。
+        """
+        if depth < 1 or layer + 1 >= n_layers:
+            return None, None
+        rows, best = [], None
+        for x in oracle.candidates(layer + 1):
+            result, child = oracle.extend(state, layer + 1, x)
+            try:
+                deeper, _ = self._look_ahead(oracle, layer + 1, child, n_layers,
+                                             depth - 1)
+            finally:
+                oracle.release(child)
+            score = result.score if deeper is None else deeper
+            rows.append({'x': x, 'score': score})
+            best = score if best is None else min(best, score)
+        return best, rows
+
     def _log_header(self, oracle):
         """表の列がどの x なのかを1行で出す。
 
@@ -315,6 +374,9 @@ class BeamSearch:
         読み手は星の位置から逆算するしかない。
         """
         candidates = oracle.candidates(0)
+        if self.lookahead:
+            self.log(f'深さ {self.lookahead}: 表の数はその子自身のスコア、'
+                     '* と最善は先読みの最良で決めている')
         header = (f'{"層":>5} {"親":<4}'
                   + ' '.join(f'{f"x={x}":>10} ' for x in candidates)
                   + ' 最善（層0 の候補。* は次のビームへ残った子）')
@@ -328,7 +390,8 @@ class BeamSearch:
                 f'{child["score"]:>10.3e}'
                 + ('*' if (row['parent'], child['x']) in survived else ' ')
                 for child in row['children'])
-            best = min(row['children'], key=lambda child: child['score'])
+            best = min(row['children'],
+                       key=lambda child: child.get('ranked_score', child['score']))
             self.log(f'{record["layer"]:>5} {row["parent"]:<4}{cells}  '
                      f'x={best["x"]}')
         for row in record['beam']:
@@ -351,9 +414,9 @@ class GreedySearch(BeamSearch):
     name = 'greedy'
 
     def __init__(self, n_active_total=N_ACTIVE, budget=None, log=None,
-                 on_layer=None):
+                 on_layer=None, lookahead=0):
         super().__init__(width=1, n_active_total=n_active_total, budget=budget,
-                         log=log, on_layer=on_layer)
+                         log=log, on_layer=on_layer, lookahead=lookahead)
 
     def allocation_name(self):
-        return self.name
+        return f'{self.name}{self._depth_suffix()}'

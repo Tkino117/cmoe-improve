@@ -37,20 +37,23 @@ SEARCHES = {
 
 
 def create_search(name, width=None, n_active_total=N_ACTIVE, budget=None,
-                  log=None, on_layer=None):
+                  log=None, on_layer=None, lookahead=0):
     check_search(name)
     return SEARCHES[name](width=width, n_active_total=n_active_total,
-                          budget=budget, log=log, on_layer=on_layer)
+                          budget=budget, log=log, on_layer=on_layer,
+                          lookahead=lookahead)
 
 
-def check_search(name, width=None):
-    """名前（と、渡されていれば幅）だけを先に検査する。
+def check_search(name, width=None, lookahead=None):
+    """名前（と、渡されていれば幅・深さ）だけを先に検査する。
 
     モデルを読み込む前に呼ぶためにある。7B を読み終えてから引数の綴り違いで
     落ちると、十数分が引数エラーのために消える。
     """
     if name not in SEARCHES:
         raise ValueError(f'未知の探索 {name!r}。{sorted(SEARCHES)} から選ぶ')
+    if lookahead is not None and lookahead < 0:
+        raise ValueError(f'--lookahead は 0 以上（{lookahead}）')
     if name == 'greedy' and width is not None and width != 1:
         raise ValueError(
             f'greedy は幅1のビームそのもの。--width {width} と両立しない '
