@@ -26,7 +26,8 @@ from dataclasses import dataclass, field
 import numpy
 import torch
 
-from cmoe.data.harness import datasets_cache, gold_index as _gold_index, load_tasks
+from cmoe.data.harness import (datasets_cache, gold_index as _gold_index,
+                               load_tasks, subtasks)
 
 # CMoE 最新版 Table 1 と同じ並び。ExpertWeaver Table 2 との共通部分でもある
 DEFAULT_TASKS = ('piqa', 'winogrande', 'arc_easy', 'arc_challenge', 'hellaswag')
@@ -162,6 +163,26 @@ def _extract(name, task, examples):
     return gold, loglikelihoods, choice_lengths, doc_hashes
 
 
+def concatenate(task, parts):
+    """複数タスクの尤度を、問題を連ねた1タスクにする。
+
+    MMLU のように、1つの名前が lm-eval では科目ごとの別タスクに割れるときに
+    使う。並びは ``parts`` の順（``harness.subtasks`` が返す名前順）で固定
+    されるので、構成をまたいで問題の対応は崩れない。
+
+    ``harness_metrics`` はタスク単位の集計なので落とす。指標は生の尤度から
+    ``bench_stats`` が作り直す。
+    """
+    return TaskSamples(
+        task=task,
+        gold=[value for part in parts for value in part.gold],
+        loglikelihoods=[row for part in parts for row in part.loglikelihoods],
+        choice_lengths=[row for part in parts for row in part.choice_lengths],
+        doc_hashes=[value for part in parts for value in part.doc_hashes],
+        num_fewshot=parts[0].num_fewshot, limit=parts[0].limit,
+        model=parts[0].model)
+
+
 def evaluate_bench(model, tokenizer, tasks=DEFAULT_TASKS, batch_size=8,
                    limit=None, num_fewshot=0, max_length=None, cache_dir=None,
                    model_name='', log=None):
@@ -173,7 +194,11 @@ def evaluate_bench(model, tokenizer, tasks=DEFAULT_TASKS, batch_size=8,
     from lm_eval.evaluator import simple_evaluate
     from lm_eval.models.huggingface import HFLM
 
-    task_objects = load_tasks(tasks, cache_dir=cache_dir)
+    # 名前1つが lm-eval の複数タスクに割れることがある（MMLU の57科目）。
+    # 走らせるのは素のタスクで、持ち帰るときに元の名前へ束ね直す
+    groups = {name: subtasks(name) for name in tasks}
+    task_objects = load_tasks(
+        [sub for found in groups.values() for sub in found], cache_dir=cache_dir)
     was_training = model.training
     model.eval()
     # softmax_dtype を明示するのは必須である。lm-eval の既定（None）は
@@ -203,14 +228,20 @@ def evaluate_bench(model, tokenizer, tasks=DEFAULT_TASKS, batch_size=8,
         model.train()
 
     samples = {}
-    for name, task in task_objects.items():
-        gold, lls, lengths, hashes = _extract(name, task, results['samples'][name])
-        samples[name] = TaskSamples(
-            task=name, gold=gold, loglikelihoods=lls, choice_lengths=lengths,
-            doc_hashes=hashes,
-            harness_metrics={key: value for key, value in results['results'][name].items()
-                             if isinstance(value, (int, float))},
-            num_fewshot=num_fewshot, limit=limit, model=model_name)
+    for name, found in groups.items():
+        parts = []
+        for sub in found:
+            gold, lls, lengths, hashes = _extract(
+                sub, task_objects[sub], results['samples'][sub])
+            parts.append(TaskSamples(
+                task=sub, gold=gold, loglikelihoods=lls, choice_lengths=lengths,
+                doc_hashes=hashes,
+                harness_metrics={key: value
+                                 for key, value in results['results'][sub].items()
+                                 if isinstance(value, (int, float))},
+                num_fewshot=num_fewshot, limit=limit, model=model_name))
+        samples[name] = parts[0] if len(parts) == 1 else concatenate(name, parts)
         if log is not None:
-            log(f'  {name:<16} {samples[name].n_docs} 問')
+            log(f'  {name:<16} {samples[name].n_docs} 問'
+                + (f'（{len(parts)} タスクを束ねた）' if len(parts) > 1 else ''))
     return samples

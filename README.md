@@ -82,7 +82,9 @@ tests/        CPU で数秒で回る動作確認
   成分ごとの本数を固定するので、seed を振っても組成が変わらない）、`benchtrain`
   （選択問題5タスクの train split を層化して引く。評価に使う split は入らない）、
   `benchqa`（同じ train split を**1問1系列**で引き、採点される対数尤度を作って
-  いる位置に印を付ける。印を使うかは `--profile-positions` が決める）
+  いる位置に印を付ける。印を使うかは `--profile-positions` が決める）、
+  `benchtrain:mmlu`（MMLU には train split が無いので dev + validation から引く。
+  採点する test は入らない）
 - アダプタ: `llama`（既存の測定を再現する経路）、`auto`（同じ層構造の他モデル）
 - ルーター方式: 現行 CMoE、頻度重心、Oracle 相関、回収率の共同最適化、
   score 校正（代表を凍結し expert ごとの gain と offset を座標上昇で合わせる）、
@@ -107,6 +109,12 @@ CMoE 最新版（ACL 2026, arXiv:2502.04416）Table 1 と同じ並びであり�
 ExpertWeaver（arXiv:2602.15521）Table 2 との共通部分でもある。どちらの論文も
 主表の動作点はスパース率25%で、ここの N=8 / A=6 がちょうどそれに当たる。動作点は
 `--nactive` で替えられる（N=8 で A=4 なら50%。[report/08](report/08_sparsity50-alloc-3seeds.md)）。
+
+**MMLU も測れる**（`--bench-tasks mmlu`、test 14,042問）。lm-eval では57科目が
+別々のタスクなので、`harness.subtasks` が名前を科目に開き、持ち帰った尤度を
+`bench.concatenate` が1タスクに束ね直す（並びは科目名順に固定されるので、構成を
+またいだ問題の対応は崩れない）。ExpertWeaver が shared 割合 α の掃引に使って
+いる指標がこれである。校正に使うときは `--calib benchtrain:mmlu`。
 
 **正答率だけを見ない。** 選択問題の採点は選択肢ごとの対数尤度の argmax であり、
 正答率はマージンの**符号**しか見ない。ここで問題になる差（PPL 0.03 ≒ 1トークン

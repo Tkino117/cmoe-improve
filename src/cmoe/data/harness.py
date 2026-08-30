@@ -11,6 +11,12 @@
 
 import contextlib
 import os
+from functools import lru_cache
+
+# train split を持たないタスクで、校正に使ってよい split。MMLU がこれで、
+# 採点は test、校正は dev（few-shot 用の5問）と validation から引く。
+# 採点する split が入っていないことは ``eligible_docs`` が毎回検査する
+CALIBRATION_SPLITS = {'mmlu': ('dev', 'validation')}
 
 # ベンチのデータセットは既定の共有キャッシュを使わない。固定した
 # ``datasets==2.21.0`` では読めない索引が共有キャッシュに混じっているためで、
@@ -70,6 +76,82 @@ def load_tasks(names, cache_dir=None):
                 f'{name} は output_type={output_type} で、選択肢ごとの尤度が'
                 '出ない。ここが扱うのは multiple_choice だけ')
     return {name: loaded[name] for name in names}
+
+
+@lru_cache(maxsize=None)
+def subtasks(name):
+    """1つの名前を、lm-eval の素のタスク名に開く。
+
+    MMLU は57科目がそれぞれ別タスクで、``mmlu`` はそれを束ねたグループである
+    （グループ → 4つの分野グループ → タグ → 科目、と2段になっているので再帰で
+    開く）。ここが返すのは常に素のタスクの名前で、素のタスクを渡せば自分1つが
+    返る。
+
+    **並びは名前順に固定する。** 束ねたあとの問題の並びがこれで決まるので、
+    構成をまたいで同じ順にならないと、問題ごとの対応（``doc_hashes``）が崩れる。
+    """
+    from lm_eval.tasks import TaskManager
+
+    index = TaskManager().task_index
+
+    def expand(current):
+        entry = index.get(current)
+        if entry is None:
+            raise ValueError(f'lm-eval に無いタスク: {current}')
+        if entry.kind.name == 'GROUP':
+            found = []
+            for child in entry.cfg['task']:
+                found += expand(child if isinstance(child, str) else child['task'])
+            return found
+        if entry.kind.name == 'TAG':
+            return [other for other, tagged in index.items()
+                    if current in (tagged.tags or ())]
+        return [current]
+
+    return tuple(sorted(set(expand(name))))
+
+
+def eligible_docs(task, splits):
+    """1タスクから、校正に使ってよい問題を返す。
+
+    既定は train split である。``splits`` が与えられたタスク（train split が
+    無いもの）はそちらから引くが、**採点に使う split が混じっていないことを
+    毎回検査する**。ここが緩むと、校正と評価が同じ問題を見ることになる。
+    """
+    if task.has_training_docs():
+        return list(task.training_docs())
+    if not splits:
+        raise ValueError(
+            f'{task.config.task} に train split が無く、代わりに使う split も'
+            '決まっていない（``CALIBRATION_SPLITS`` に書く）')
+    scored = task.config.test_split or task.config.validation_split
+    overlap = [split for split in splits if split == scored]
+    if overlap:
+        raise ValueError(
+            f'{task.config.task}: 採点に使う split {overlap} を校正に引こうと'
+            'している')
+    missing = [split for split in splits if split not in task.dataset]
+    if missing:
+        raise ValueError(f'{task.config.task} に split {missing} が無い')
+    return [doc for split in splits for doc in task.dataset[split]]
+
+
+def calibration_split(name):
+    """校正がどの split から引いたかの札。記録に残す用。"""
+    return '+'.join(CALIBRATION_SPLITS.get(name, ('train',)))
+
+
+def calibration_docs(name, cache_dir=None):
+    """校正に使ってよい問題を ``(タスク実体, 問題)`` で返す。
+
+    「どの split を校正に引いてよいか」を決めるのはここ1箇所である。詰め方
+    （連結して窓を切るか、1問1系列にするか）は読む側が決める。
+    """
+    splits = CALIBRATION_SPLITS.get(name)
+    for sub in subtasks(name):
+        task = load_tasks([sub], cache_dir=cache_dir)[sub]
+        for doc in eligible_docs(task, splits):
+            yield task, doc
 
 
 def gold_index(task, doc, n_choices):

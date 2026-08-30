@@ -48,7 +48,7 @@ import torch
 
 from cmoe.data.base import CONTEXT, PAD, SCORED, TokenSet, load_tokenizer
 from cmoe.data.benchtrain import TASKS, allocate
-from cmoe.data.harness import DEFAULT_CACHE, load_tasks, render_parts
+from cmoe.data.harness import DEFAULT_CACHE, calibration_docs, render_parts
 
 # 1系列の上限。超えた問題は文脈の頭を落として収める（BOS は残す）。
 # 全系列を最長に合わせて右詰めするので、上限がそのまま埋めの量を決める。
@@ -81,15 +81,14 @@ class Component:
 
 @lru_cache(maxsize=None)
 def documents(task_name, cache_dir=DEFAULT_CACHE):
-    """1タスクの train split を (文脈, 続き) の対にしたもの。
+    """1タスクの校正用の問題を (文脈, 続き) の対にしたもの。
 
     ``benchtrain.documents`` と同じ問題を、繋がずに持つ。繋いだものが要るのは
-    窓を切る側だけで、こちらは切れ目を使う。
+    窓を切る側だけで、こちらは切れ目を使う。どの split を引いてよいかを決める
+    のは ``harness.calibration_docs`` である。
     """
-    task = load_tasks([task_name], cache_dir=cache_dir)[task_name]
-    if not task.has_training_docs():
-        raise ValueError(f'{task_name} に train split が無い')
-    return tuple(render_parts(task, doc) for doc in task.training_docs())
+    return tuple(render_parts(task, doc)
+                 for task, doc in calibration_docs(task_name, cache_dir))
 
 
 def encode_pair(tokenizer, context, continuation):

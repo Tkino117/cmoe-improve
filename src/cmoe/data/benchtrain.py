@@ -33,7 +33,8 @@ import random
 import torch
 
 from cmoe.data.base import TokenSet, load_tokenizer
-from cmoe.data.harness import DEFAULT_CACHE, load_tasks, render_document
+from cmoe.data.harness import (DEFAULT_CACHE, calibration_docs,
+                               calibration_split, render_document)
 from cmoe.data.wikitext2 import non_overlapping_starts, take
 
 # ``eval.bench.DEFAULT_TASKS`` と同じ並び。ここで import しないのは依存の向き
@@ -59,6 +60,7 @@ class Component:
     n_tokens: int
     n_chars: int
     pool_documents: int
+    split: str = 'train'
 
     def metadata(self):
         return {
@@ -70,7 +72,7 @@ class Component:
             'pool_documents': self.pool_documents,
             'pool_tokens': self.n_tokens,
             'chars_per_token': round(self.n_chars / self.n_tokens, 3),
-            'split': 'train',
+            'split': self.split,
         }
 
 
@@ -93,14 +95,14 @@ def allocate(count, tasks=TASKS):
 
 @lru_cache(maxsize=None)
 def documents(task_name, cache_dir=DEFAULT_CACHE):
-    """1タスクの train split を、1問1本のテキストに直したもの。
+    """1タスクの校正用の問題を、1問1本のテキストに直したもの。
 
-    ``run`` は seed × 配分のぶんだけ校正を読み直すので覚えておく。
+    どの split を引いてよいかを決めるのは ``harness.calibration_docs`` で、
+    既定は train split である。``run`` は seed × 配分のぶんだけ校正を読み直す
+    ので覚えておく。
     """
-    task = load_tasks([task_name], cache_dir=cache_dir)[task_name]
-    if not task.has_training_docs():
-        raise ValueError(f'{task_name} に train split が無い')
-    return tuple(render_document(task, doc) for doc in task.training_docs())
+    return tuple(render_document(task, doc)
+                 for task, doc in calibration_docs(task_name, cache_dir))
 
 
 def _gather(texts, need, rng):
@@ -117,7 +119,7 @@ def _gather(texts, need, rng):
     return tuple(picked), size
 
 
-def draw_component(tokenizer, texts, seqlen, count, seed, name):
+def draw_component(tokenizer, texts, seqlen, count, seed, name, split='train'):
     """1タスクから count 本。
 
     タスクごとに独立の種を使う。同じ seed を全タスクで使い回すと、タスクを
@@ -139,7 +141,7 @@ def draw_component(tokenizer, texts, seqlen, count, seed, name):
     starts = non_overlapping_starts(n_tokens, seqlen, count, stream)
     return take(ids, starts, seqlen), Component(
         name=name, starts=starts, documents=picked, n_tokens=n_tokens,
-        n_chars=n_chars, pool_documents=len(texts))
+        n_chars=n_chars, pool_documents=len(texts), split=split)
 
 
 def calibration(model, seqlen, n_samples, seed, name='benchtrain',
@@ -161,8 +163,13 @@ def calibration(model, seqlen, n_samples, seed, name='benchtrain',
     for task_name in tasks:
         block, component = draw_component(
             tokenizer, documents(task_name, cache_dir), seqlen,
-            counts[task_name], seed, task_name)
+            counts[task_name], seed, task_name,
+            split=calibration_split(task_name))
         blocks.append(block)
         components.append(component)
-    return TokenSet(f'{name}-train-calib', torch.cat(blocks, dim=0), (),
+    # 札は引いた split をそのまま名乗る。5タスクはすべて train なので既存の
+    # 名前は変わらず、MMLU だけが ``-dev+validation-calib`` になる
+    labels = sorted({calibration_split(task_name) for task_name in tasks})
+    label = labels[0] if len(labels) == 1 else 'mixed'
+    return TokenSet(f'{name}-{label}-calib', torch.cat(blocks, dim=0), (),
                     tuple(components))

@@ -47,6 +47,11 @@ CALIBRATION_SETS = {
     **{f'benchqa:{task}': _benchqa_subset(task, (task,))
        for task in benchtrain.TASKS},
     'benchqa:arc': _benchqa_subset('arc', ('arc_easy', 'arc_challenge')),
+    # MMLU は57科目が lm-eval では別タスクで、``harness.subtasks`` が束ねる。
+    # train split が無いので校正は dev + validation から引く（採点は test）。
+    # ``benchqa`` 版は無い — MMLU の続きは選択肢の記号1文字なので、1問の採点
+    # 位置が1つしかなく、母集団 1,816 問では既定の 16,384 位置に届かない
+    'benchtrain:mmlu': _benchtrain_subset('mmlu', ('mmlu',)),
 }
 
 # ルーター方式が要る carve / fit / validation の3本組。
