@@ -127,10 +127,20 @@ def forward_chunked(moe, z, residual, batch_chunk=None, device=None):
 
     戻り値は z と同じデバイス。``batch_chunk`` を指定したときだけ分割して進める
     （各系列は独立に流れるので、分けても数値は変わらない）。
+
+    **分割幅が系列数以上でも、載せ替えは省かない。** 分割を頼まれているときは
+    呼ぶ側が z をホストに置いている（``alloc.oracles.base.LayerWalk`` の既定が
+    そうである）ので、1塊で済むからといってそのまま渡すと、ホストの z に
+    カードの重みを当てることになる。系列数が分割幅を下回るときだけ起きるので、
+    校正セットが小さいときにだけ現れる。
     """
-    step = batch_chunk or z.shape[0]
-    if step >= z.shape[0]:
+    if batch_chunk is None:
+        # 分けないときは呼ぶ側が層と同じ側に載せている。既存の測定はここを通る
         return moe(z) + residual
+    step = batch_chunk
+    target = device if device is not None else z.device
+    if step >= z.shape[0]:
+        return (moe(z.to(target)) + residual.to(target)).to(z.device)
     output = torch.empty_like(z, device=z.device)
     for start in range(0, z.shape[0], step):
         stop = min(start + step, z.shape[0])

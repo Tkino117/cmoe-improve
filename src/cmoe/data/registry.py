@@ -4,7 +4,8 @@
 評価にしか使わないもの（c4-new）、carve にしか使わないものが今後も出るため。
 """
 
-from cmoe.data import benchqa, benchtrain, c4, flanv2, slimpajama, wikitext2
+from cmoe.data import (benchchoice, benchqa, benchtrain, c4, flanv2,
+                       slimpajama, wikitext2)
 
 def _benchtrain_subset(label, tasks):
     """一部のタスクだけで引く benchtrain。本数は変えない（n_samples 本を配る）。
@@ -24,6 +25,16 @@ def _benchqa_subset(label, tasks):
     def loader(model, seqlen, n_samples, seed):
         return benchqa.calibration(model, seqlen, n_samples, seed,
                                    name=f'benchqa-{label}', tasks=tasks)
+    return loader
+
+
+def _benchchoice_subset(label, tasks, budget_unit=None):
+    """一部のタスクだけで引く benchchoice。予算の総量は変えない。"""
+    def loader(model, seqlen, n_samples, seed):
+        options = {} if budget_unit is None else {'budget_unit': budget_unit}
+        return benchchoice.calibration(model, seqlen, n_samples, seed,
+                                       name=f'benchchoice-{label}', tasks=tasks,
+                                       **options)
     return loader
 
 
@@ -47,6 +58,19 @@ CALIBRATION_SETS = {
     **{f'benchqa:{task}': _benchqa_subset(task, (task,))
        for task in benchtrain.TASKS},
     'benchqa:arc': _benchqa_subset('arc', ('arc_easy', 'arc_challenge')),
+    # 同じ問題を**選択肢ごとに1系列**で引いたもの。選択肢どうしを比べる目的
+    # 関数 — ``--oracle margin`` — が要る唯一のセットである。予算はタスクごとの
+    # 問題数で数える（マージンは問題ごとの量なので、位置で配ると問題数が続きの
+    # 長さで決まってしまう）
+    'benchchoice': benchchoice.calibration,
+    **{f'benchchoice:{task}': _benchchoice_subset(task, (task,))
+       for task in benchtrain.TASKS},
+    'benchchoice:arc': _benchchoice_subset('arc', ('arc_easy', 'arc_challenge')),
+    # 同じものを benchqa と同じ数え方（正解肢の採点位置）で引いたもの。同じ引数
+    # なら benchqa とまったく同じ問題が選ばれるので、report/14 と校正の問題集合
+    # を揃えたまま目的関数だけを替える対照に使う
+    'benchchoice-qa': _benchchoice_subset('qa', benchtrain.TASKS,
+                                          budget_unit='gold_scored'),
     # MMLU は57科目が lm-eval では別タスクで、``harness.subtasks`` が束ねる。
     # train split が無いので校正は dev + validation から引く（採点は test）。
     # ``benchqa`` 版は無い — MMLU の続きは選択肢の記号1文字なので、1問の採点

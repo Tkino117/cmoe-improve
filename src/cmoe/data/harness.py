@@ -201,10 +201,32 @@ def render_parts(task, doc):
     繋ぐと ``render_document`` と1文字も違わない。1問1系列で引くセットは、
     lm-eval が採点する続きがどこから始まるかを知る必要があるので、こちらを
     読む。切れ目の定義がここ1箇所にしか無いことが要点である。
+
+    正解肢だけを取り出す形なので、``render_choice_parts`` の gold 番目そのもの
+    である。2実装を置かないために、そう書いてある。
+    """
+    parts, gold = render_choice_parts(task, doc)
+    return parts[gold]
+
+
+def render_choice_parts(task, doc):
+    """1問を**選択肢ごと**の (文脈, 続き) K本と、正解番号にする。
+
+    ``render_parts`` が正解肢1本しか返さないのは、素の校正データが「問題文の
+    あとに正しい続きが来る」形だけを要るからである。マージンを目的関数にする
+    校正は不正解肢も要る — lm-eval が正誤を決めるのは K 本の対数尤度の比較で
+    あって、正解肢1本の値ではない。
+
+    切り方は ``render_parts`` と同じ規則で、変えているのは「どの選択肢を入れる
+    か」だけである。WinoGrande（``multiple_input``）は選択肢が文脈の側に立つの
+    で、K 本が文脈違い・続き共通になる。ふつうのタスクはその逆で、文脈共通・
+    続き違いになる。
     """
     choices = task.doc_to_choice(doc)
-    index = gold_index(task, doc, len(choices))
+    gold = gold_index(task, doc, len(choices))
     delimiter = task.config.target_delimiter
     if getattr(task, 'multiple_input', 0):
-        return choices[index], delimiter + task.doc_to_target(doc)
-    return task.doc_to_text(doc), delimiter + choices[index]
+        continuation = delimiter + task.doc_to_target(doc)
+        return tuple((choice, continuation) for choice in choices), gold
+    context = task.doc_to_text(doc)
+    return tuple((context, delimiter + choice) for choice in choices), gold

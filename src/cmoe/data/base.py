@@ -33,6 +33,71 @@ def tensor_hash(tensor):
 
 
 @dataclass(frozen=True)
+class ChoiceGroups:
+    """行 → 問題の対応。1問を**選択肢ごとに1系列**で持つセットだけが持つ。
+
+    素の校正データにも、正解肢だけを引く ``benchqa`` にも、この対応は無い —
+    そこでは1系列が1つの独立な読み物で、系列をまたいで束ねる意味が無いからで
+    ある。束ねる意味が出るのは、目的関数が**選択肢どうしの比較**になったとき
+    だけで、それがマージンである。
+
+    rows[q]:  問題 q の選択肢 0..K-1 が入っている行番号。K は問題ごとに違って
+              よい（PIQA は2、HellaSwag は4）
+    gold[q]:  問題 q の正解番号。``harness.gold_index`` が出したもの
+    tasks[q]: その問題を出したタスク名。ベンチの集計がタスクを等しく重み付ける
+              マクロ平均なので、目的関数の側も同じ束ね方ができるように持つ
+    """
+
+    rows: tuple
+    gold: tuple
+    tasks: tuple
+
+    def __post_init__(self):
+        if not (len(self.rows) == len(self.gold) == len(self.tasks)):
+            raise ValueError(
+                f'問題ごとの3つの並びが揃っていない: 行 {len(self.rows)}、'
+                f'正解 {len(self.gold)}、タスク {len(self.tasks)}')
+        for index, (choices, gold) in enumerate(zip(self.rows, self.gold)):
+            if len(choices) < 2:
+                raise ValueError(
+                    f'問題 {index}: 選択肢が {len(choices)} 本しか無い。'
+                    'マージンは比べる相手が要る')
+            if not 0 <= gold < len(choices):
+                raise ValueError(
+                    f'問題 {index}: 正解番号 {gold} が選択肢 {len(choices)} 本に'
+                    '収まらない')
+
+    @property
+    def n_questions(self):
+        return len(self.rows)
+
+    @property
+    def n_rows(self):
+        return sum(len(choices) for choices in self.rows)
+
+    def check_rows(self, n_sequences):
+        """行番号が実際の系列を1つずつ指しているか。
+
+        ここが緩むと、別の問題の選択肢を1本の問題として比べることになる。
+        黙って混ざる失敗の形なので、作った直後に閉じる。
+        """
+        seen = sorted(row for choices in self.rows for row in choices)
+        if seen != list(range(n_sequences)):
+            raise ValueError(
+                f'行番号が {n_sequences} 系列と1対1でない'
+                f'（{len(seen)} 個、重複 {len(seen) - len(set(seen))} 個）')
+
+    def metadata(self):
+        return {
+            'n_questions': self.n_questions,
+            'n_rows': self.n_rows,
+            'choices_per_question': sorted(
+                {len(choices) for choices in self.rows}),
+            'tasks': sorted(set(self.tasks)),
+        }
+
+
+@dataclass(frozen=True)
 class TokenSet:
     """ひと揃いのトークン列。
 
@@ -46,6 +111,9 @@ class TokenSet:
                PAD / CONTEXT / SCORED のどれか。**素の文章のセットは持たない**
                （None）。持つのは、1問1系列で引いて「どこが採点に効く位置か」
                を知っているセットだけである
+    choices:   ``ChoiceGroups``。1問を選択肢ごとの系列で持つセットだけが
+               持つ（None が既定）。選択肢どうしを比べる目的関数 — マージン —
+               を作れるのは、この対応があるセットだけである
 
     starts は混合セットでは空にする。成分ごとに別の連結列を切るので、位置を
     1本に並べると何を基準にした値か分からなくなるためである。
@@ -56,6 +124,7 @@ class TokenSet:
     starts: tuple = ()
     components: tuple = ()
     segments: object = None
+    choices: object = None
 
     @property
     def n_sequences(self):
@@ -132,6 +201,8 @@ class TokenSet:
                 'scored': int((self.segments == SCORED).sum()),
                 'hash': tensor_hash(self.segments),
             }
+        if self.choices is not None:
+            data['choices'] = self.choices.metadata()
         if self.components:
             data['components'] = [component.metadata()
                                   for component in self.components]

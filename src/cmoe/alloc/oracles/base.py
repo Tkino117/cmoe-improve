@@ -117,7 +117,7 @@ class LayerWalk:
     def __init__(self, adapter, inputs, layer_factory, n_experts,
                  n_active_total=6, k_act=10, profiling_norm=True,
                  batch_chunk=None, state_device='cpu', profile_mask=None,
-                 score_weights=None):
+                 score_weights=None, choices=None):
         self.adapter = adapter
         self.inputs = inputs
         self.layer_factory = layer_factory
@@ -137,6 +137,17 @@ class LayerWalk:
         # 「どの位置の活性でニューロンを切り分けるか」ではない。2つを別々に
         # 動かせることが、形の効果と位置の効果を分ける実験点になる
         self.score_weights = score_weights
+        # 選択肢どうしを比べる目的関数が要る対応（``alloc.base.ChoiceScoring``）。
+        # None なら、そういう目的関数は組めない。**位置ごとの重みとは別物で
+        # ある** — あちらは位置に閉じた量の平均の取り方で、こちらは「1つの点が
+        # K 本の系列にまたがる」という構造そのものである
+        self.choices = choices
+        if choices is not None:
+            expected = tuple(inputs.hidden.shape[:2])
+            if tuple(choices.keep.shape) != expected:
+                raise ValueError(
+                    f'選択肢の印は {tuple(choices.keep.shape)}、校正入力は '
+                    f'{expected} — 対応していない')
         if score_weights is not None:
             expected = tuple(inputs.hidden.shape[:2])
             if tuple(score_weights.shape) != expected:

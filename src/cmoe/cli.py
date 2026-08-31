@@ -40,8 +40,10 @@ import torch
 
 from cmoe import runlog
 from cmoe.adapters.registry import create_adapter, guess_adapter
+from cmoe.alloc.base import build_choice_scoring
 from cmoe.alloc.oracles.base import LayerWalk, score_allocation
-from cmoe.alloc.oracles.registry import check_oracle, create_oracle
+from cmoe.alloc.oracles.registry import (ORACLE_OPTIONS, check_oracle,
+                                         create_oracle)
 from cmoe.alloc.search.beam import BudgetExceeded
 from cmoe.alloc.search.fixed import parse_allocation
 from cmoe.alloc.search.registry import check_search, create_search
@@ -171,6 +173,11 @@ def build_parser():
                      help='タスクあたりの問題数を絞る（動作確認用）')
     run.add_argument('--bench-batch-size', type=int, default=8)
     run.add_argument('--bench-fewshot', type=int, default=0)
+    run.add_argument(
+        '--bench-max-length', type=int, default=None,
+        help='ベンチが1系列に許す長さ（省略時は --seqlen）。--seqlen は校正の量と '
+             'PPL の窓幅も兼ねているので、校正の量を小さく取る構成では '
+             'ベンチが読めない長さになる。そこだけを外すための引数')
     run.add_argument('--bench-cache-dir', default=DEFAULT_BENCH_CACHE,
                      help='ベンチのデータセットのキャッシュ。共有キャッシュを'
                           '使うには空文字を渡す')
@@ -241,6 +248,14 @@ def add_oracle_arguments(parser, layers_help):
                              '（0〜1）。1 で答え部分だけ、0 で文脈だけ。省略時は'
                              '実位置を等しく数える（埋めは常に 0）。印を持つ'
                              '校正セットが要る')
+    parser.add_argument(
+        '--margin-beta', type=float, default=None,
+        help='--oracle margin の softmin の鋭さ β（既定 1）。大きいほど「最も'
+             '惜しい不正解1本」に寄り、β→∞ で bench の margin の符号反転になる')
+    parser.add_argument(
+        '--margin-loss', default=None, choices=('raw', 'softplus'),
+        help='--oracle margin の目的関数の形（既定 raw）。softplus は下に有界'
+             'で、β=1 のとき bench の gold_nll と厳密に一致する')
     parser.add_argument('--no-profiling-norm', action='store_true')
     parser.add_argument('--no-router-norm', action='store_true')
     parser.add_argument('--layers', type=int, default=None, help=layers_help)
@@ -361,7 +376,7 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
                 adapter.model, tokenizer,
                 tasks=parse_list(args.bench_tasks),
                 batch_size=args.bench_batch_size, limit=args.bench_limit,
-                num_fewshot=args.bench_fewshot, max_length=args.seqlen,
+                num_fewshot=args.bench_fewshot, max_length=bench_max_length(args),
                 cache_dir=args.bench_cache_dir or None, model_name=args.model)
             rows = bench_stats.summarize(bench_samples[name])
             for task, values in rows['tasks'].items():
@@ -594,7 +609,7 @@ def measure_dense_bench(args, out):
         adapter.model, load_tokenizer(args.model),
         tasks=parse_list(args.bench_tasks), batch_size=args.bench_batch_size,
         limit=args.bench_limit, num_fewshot=args.bench_fewshot,
-        max_length=args.seqlen, cache_dir=args.bench_cache_dir or None,
+        max_length=bench_max_length(args), cache_dir=args.bench_cache_dir or None,
         model_name=args.model)
     rows = bench_stats.summarize(samples)
     for task, values in rows['tasks'].items():
@@ -744,6 +759,7 @@ def build_walk(args, adapter, calibration):
     inputs = adapter.capture_layer_inputs(calibration.input_ids)
     profile_mask = scored_mask(args, calibration)
     weights = score_weights(args, calibration)
+    choices = choice_scoring(args, calibration)
     factory = layer_factory(
         create_carver(args.carver, args.nexperts, k_act=args.k_act),
         args.nexperts,
@@ -753,7 +769,7 @@ def build_walk(args, adapter, calibration):
         adapter, inputs, factory, args.nexperts,
         n_active_total=args.nactive, k_act=args.k_act,
         profiling_norm=not args.no_profiling_norm, batch_chunk=args.batch_chunk,
-        profile_mask=profile_mask, score_weights=weights)
+        profile_mask=profile_mask, score_weights=weights, choices=choices)
 
 
 def scored_mask(args, calibration):
@@ -784,6 +800,10 @@ def score_weights(args, calibration):
         raise SystemExit(
             f'{calibration.name} は採点位置の印を持たない。'
             '--scored-weight には印を持つ校正セット（benchqa）が要る')
+    if args.oracle == 'margin':
+        # margin は採点する位置を自分で決める（選択肢の続きの位置すべて）。
+        # 位置ごとの重みという概念が要らないので、渡さない
+        return None
     weights = calibration.position_weights(args.scored_weight)
     if weights is not None:
         share = ('実位置を等しく' if args.scored_weight is None
@@ -791,6 +811,55 @@ def score_weights(args, calibration):
         log(f'  採点する位置: {int((weights > 0).sum())} / {weights.numel()}'
             f'（答え部分の重み {share}）')
     return weights
+
+
+# 全層を走らせて測るオラクル。層ローカル指標と違い「走らせなかった活性」を
+# 見ないので、A >= N（routed を全部走らせる設定）でも意味のある値を返す
+def bench_max_length(args):
+    """ベンチが1系列に許す長さ。省略時は ``--seqlen`` そのもの。
+
+    ``--seqlen`` は3つの役を兼ねている — 校正セットの量、PPL の窓幅、そして
+    ベンチが1系列に許す長さである。素の文章を窓で切る校正ではこの3つが同じ
+    2048 で揃っていたが、量を「問題数」で数える校正（``benchchoice``）では
+    ``--seqlen`` が小さな数になり、そのままではベンチの選択肢が入らない。
+    校正を1トークンも変えずにそこだけを外せるように、別の引数にしてある。
+
+    **省略すれば既存のすべての測定と同じ経路を通る**（1ビットも動かない）。
+    """
+    return args.bench_max_length if args.bench_max_length is not None else args.seqlen
+
+
+WHOLE_MODEL_ORACLES = ('suffix_kl', 'margin')
+
+
+def choice_scoring(args, calibration):
+    """選択肢どうしを比べる目的関数が要る対応。要らないオラクルでは None。
+
+    ``TokenSet`` を alloc へ渡さず、素材だけを渡して組み直す。alloc が data を
+    import しない、という依存の向きをここで守る。
+    """
+    if args.oracle != 'margin':
+        return None
+    if calibration.choices is None:
+        raise SystemExit(
+            f'{calibration.name} は選択肢ごとの系列を持たない。'
+            '--oracle margin には --calib benchchoice が要る'
+            '（benchqa は正解肢しか持たないので、比べる相手が無い）')
+    scoring = build_choice_scoring(
+        calibration.input_ids, calibration.scored_mask(),
+        calibration.choices.rows, calibration.choices.gold,
+        calibration.choices.tasks)
+    log(f'  マージンで採点: {scoring.n_questions} 問 / {scoring.n_rows} 系列 / '
+        f'{scoring.n_positions} 位置（β={args.margin_beta or 1.0:g} '
+        f'loss={args.margin_loss or "raw"}）')
+    return scoring
+
+
+def oracle_options(args):
+    """オラクル固有の引数だけを束ねる。名前ごとの分岐はここ1箇所。"""
+    if args.oracle == 'margin':
+        return {'beta': args.margin_beta, 'loss': args.margin_loss}
+    return {}
 
 
 def check_search_arguments(args):
@@ -813,10 +882,18 @@ def check_oracle_arguments(args):
         # `args.layers or n_layers` は 0 を falsy として全層に化かす。配線確認の
         # つもりの --layers 0 で本番が始まる
         raise SystemExit(f'--layers は 1 以上（{args.layers}）')
-    if args.nactive >= args.nexperts and args.oracle != 'suffix_kl':
+    if args.nactive >= args.nexperts and args.oracle not in WHOLE_MODEL_ORACLES:
         raise SystemExit(
             f'A={args.nactive} は N={args.nexperts} 以上。どの候補も routed を'
             f'全部走らせるので、{args.oracle} は全候補で 0 を返し、何も測らない')
+    stray = [name for oracle, names in ORACLE_OPTIONS.items()
+             for name in names
+             if oracle != args.oracle and getattr(args, name) is not None]
+    if stray:
+        raise SystemExit(
+            f'--oracle {args.oracle} は '
+            f'{", ".join("--" + name.replace("_", "-") for name in stray)} を'
+            '見ない。オラクルを間違えているか、引数が余っている')
 
 
 def command_search(args):
@@ -842,7 +919,7 @@ def command_search(args):
         f'hash={calibration.metadata()["token_hash"][:12]}')
 
     walk = build_walk(args, adapter, calibration)
-    oracle = create_oracle(args.oracle, walk)
+    oracle = create_oracle(args.oracle, walk, **oracle_options(args))
     if args.token_chunk is not None and hasattr(oracle, 'token_chunk'):
         oracle.token_chunk = args.token_chunk
 
@@ -865,11 +942,25 @@ def command_search(args):
     # 床は最後の測り直しの合否を決めるので、それを持つオラクルでは必ず測る。
     # 読み出し1回ぶんで、探索本体に比べれば無視できる
     floor = None
+    if hasattr(oracle, 'reference_score'):
+        # dense のスコア。KL では 0（下限）なので測る意味が無いが、マージンでは
+        # 下限ではない参照点で、探索がこれを下回ることは起こりうる
+        reference = oracle.reference_score()
+        payload['dense_score'] = reference
+        log(f'dense の {oracle.name}: {reference:.6f}（下限ではなく参照点。'
+            'この目的関数はこれを下回りうる）')
+        if hasattr(oracle, 'reference_details'):
+            # スコア1つでは「目的関数を下げながら正答率を落としていないか」が
+            # 読めない。dense の内訳を並べられるようにここで残す
+            details = oracle.reference_details()
+            payload['dense_details'] = details
+            if 'calibration_acc' in details:
+                log(f'  dense の校正上の acc: {details["calibration_acc"]:.4f}')
     if hasattr(oracle, 'nondeterminism_floor'):
         floor = oracle.nondeterminism_floor()
         payload['nondeterminism'] = floor
-        log(f'dense 読み出しを2回: KL {floor:.3e}（この機械の非決定性の床。'
-            'これより小さい差は区別できない）')
+        log(f'dense 読み出しを2回: {oracle.name} の差 {floor:.3e}'
+            '（この機械の非決定性の床。これより小さい差は区別できない）')
     runlog.write_json(json_path, payload)
 
     def on_layer(records):
@@ -977,7 +1068,7 @@ def command_score(args):
         f'hash={calibration.metadata()["token_hash"][:12]}')
 
     walk = build_walk(args, adapter, calibration)
-    oracle = create_oracle(args.oracle, walk)
+    oracle = create_oracle(args.oracle, walk, **oracle_options(args))
     if args.token_chunk is not None and hasattr(oracle, 'token_chunk'):
         oracle.token_chunk = args.token_chunk
 
@@ -991,11 +1082,25 @@ def command_score(args):
         'scores': [],
     }
     floor = None
+    if hasattr(oracle, 'reference_score'):
+        # dense のスコア。KL では 0（下限）なので測る意味が無いが、マージンでは
+        # 下限ではない参照点で、探索がこれを下回ることは起こりうる
+        reference = oracle.reference_score()
+        payload['dense_score'] = reference
+        log(f'dense の {oracle.name}: {reference:.6f}（下限ではなく参照点。'
+            'この目的関数はこれを下回りうる）')
+        if hasattr(oracle, 'reference_details'):
+            # スコア1つでは「目的関数を下げながら正答率を落としていないか」が
+            # 読めない。dense の内訳を並べられるようにここで残す
+            details = oracle.reference_details()
+            payload['dense_details'] = details
+            if 'calibration_acc' in details:
+                log(f'  dense の校正上の acc: {details["calibration_acc"]:.4f}')
     if hasattr(oracle, 'nondeterminism_floor'):
         floor = oracle.nondeterminism_floor()
         payload['nondeterminism'] = floor
-        log(f'dense 読み出しを2回: KL {floor:.3e}（この機械の非決定性の床。'
-            'これより小さい差は区別できない）')
+        log(f'dense 読み出しを2回: {oracle.name} の差 {floor:.3e}'
+            '（この機械の非決定性の床。これより小さい差は区別できない）')
     runlog.write_json(json_path, payload)
 
     started = time.time()

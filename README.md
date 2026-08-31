@@ -36,6 +36,9 @@ uv run cmoe run --calib benchqa --profile-positions scored --alloc uniform4 --be
 uv run cmoe search --calib benchqa --profile-positions scored \
     --scored-weight 1.0 --search beam --width 2
 
+# 親モデルとの KL ではなく、選択問題の採点そのもので探す
+uv run cmoe search --calib benchchoice --oracle margin --search beam --width 2
+
 # 探索を走らせず、与えた配分を同じオラクルで採点する。対照の一様配分を
 # 「評価指標を見て選ぶ」のではなく、探索と同じ目的関数で選ぶのに使う
 uv run cmoe score --oracle suffix_kl --alloc uniform3 --alloc uniform4
@@ -83,15 +86,20 @@ tests/        CPU で数秒で回る動作確認
   （選択問題5タスクの train split を層化して引く。評価に使う split は入らない）、
   `benchqa`（同じ train split を**1問1系列**で引き、採点される対数尤度を作って
   いる位置に印を付ける。印を使うかは `--profile-positions` が決める）、
-  `benchtrain:mmlu`（MMLU には train split が無いので dev + validation から引く。
-  採点する test は入らない）
+  `benchchoice`（同じ問題を**選択肢ごとに1系列**で引き、行と問題の対応を持つ。
+  選択肢どうしを比べる目的関数が要る唯一のセット。予算はタスクごとの問題数で
+  数える）、`benchtrain:mmlu`（MMLU には train split が無いので dev + validation
+  から引く。採点する test は入らない）
 - アダプタ: `llama`（既存の測定を再現する経路）、`auto`（同じ層構造の他モデル）
 - ルーター方式: 現行 CMoE、頻度重心、Oracle 相関、回収率の共同最適化、
   score 校正（代表を凍結し expert ごとの gain と offset を座標上昇で合わせる）、
   expert 平均（素/centered）、診断用 `|h|` オラクル
 - ルーター診断: `|h|` 回収率、Oracle gap 回収率、Top-K の recall と完全一致率
 - 採点オラクル: `mass`（活性質量の回収率）、`mass_squared`、`local_error`（層の
-  出力誤差 L）、`suffix_kl`（残りを dense のまま走らせた出力分布の KL）
+  出力誤差 L）、`suffix_kl`（残りを dense のまま走らせた出力分布の KL）、
+  `margin`（選択問題の採点そのもの。正解と、最も惜しい不正解の対数尤度の差。
+  `--margin-beta` の両端で `bench_stats` の `margin` と `gold_nll` に一致する。
+  `benchchoice` が要る）
 - 活性を数える位置: 全位置（既定）と、採点される対数尤度を作っている位置だけ
   （`--profile-positions scored`。印を持つ校正セットが要る）
 - オラクルが採点する位置: `--scored-weight` が、目的関数のうち答え部分が占める

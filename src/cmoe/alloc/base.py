@@ -29,6 +29,8 @@ GPU も 13GB のモデルも無しに検査できるところに置く。
 from dataclasses import dataclass, field
 from typing import Protocol
 
+import torch
+
 
 @dataclass(frozen=True)
 class Allocation:
@@ -77,6 +79,117 @@ class Allocation:
             'n_active_total': self.n_active_total,
             'mean_x': self.mean_x,
         }
+
+
+@dataclass(frozen=True)
+class ChoiceScoring:
+    """選択肢どうしを比べる目的関数が要る、位置と行の対応。
+
+    親モデルとの近さを測るオラクル（``suffix_kl``）は位置ごとの重みだけで足りる
+    — どの位置も独立に採点でき、束ねるのは最後の平均だけだからである。**採点
+    そのもの**を測るオラクル（``margin``）はそうではない。1つの点が K 本の系列
+    にまたがる採点位置の和から出て、その K 本が1問を成す、という対応が要る。
+
+    その対応は校正セットの引き方（``data.benchchoice``）が持っている知識で、
+    alloc からは見えない。橋渡しをここに置くのは、alloc が data を import しない
+    という依存の向きを保つためである。組み立てるのは cli で、``from_token_set``
+    に素のテンソルと並びを渡す。
+
+    keep:        採点位置だけ True の [n_sequences, seqlen]。``forward_suffix``
+                 にそのまま渡すと、その位置の読み出しだけが [位置, 語彙] で返る
+    targets:     keep の各位置が**予測すべき**トークン id [位置]。1つ後ろの
+                 トークンである（印は1つ手前に付いている）
+    row_index:   keep の各位置がどの系列のものか [位置]
+    choice_rows: [問題, K_max] の行番号。K が問題ごとに違うので右を埋める
+    choice_mask: choice_rows の有効な升だけ True
+    gold_column: 問題ごとの、正解肢が入っている列 [問題]
+    task_index:  問題ごとのタスク番号 [問題]。タスク名は ``task_names``
+
+    ``keep`` を並べた順（行優先）と ``targets`` / ``row_index`` の並びは同じで
+    ある。``forward_suffix`` が塊ごとに ``logits[keep]`` を取って繋ぐので、
+    どちらも「行、位置」の辞書順になる — この一致が、点とトークンの対応が
+    崩れない理由そのものである。
+    """
+
+    keep: object
+    targets: object
+    row_index: object
+    choice_rows: object
+    choice_mask: object
+    gold_column: object
+    task_index: object
+    task_names: tuple
+
+    @property
+    def n_rows(self):
+        return self.keep.shape[0]
+
+    @property
+    def n_positions(self):
+        return self.targets.shape[0]
+
+    @property
+    def n_questions(self):
+        return self.choice_rows.shape[0]
+
+    def metadata(self):
+        return {
+            'n_questions': self.n_questions,
+            'n_rows': self.n_rows,
+            'n_scored_positions': self.n_positions,
+            'tasks': list(self.task_names),
+        }
+
+
+def build_choice_scoring(input_ids, scored_mask, rows, gold, tasks):
+    """校正セットの素材から ``ChoiceScoring`` を組む。
+
+    ``input_ids`` と ``scored_mask`` は [n_sequences, seqlen]、``rows`` は問題
+    ごとの行番号、``gold`` は正解番号、``tasks`` は問題ごとのタスク名である
+    （``data.base.ChoiceGroups`` がそのまま持っている3つ）。
+
+    **印が最終列に立っていないことを検査する。** 印の1つ後ろが予測すべき
+    トークンなので、最終列に印があると読む先が無い。右詰めの規約が守られて
+    いれば起こらないが、黙って隣の系列の先頭を読む形の壊れ方なので閉じる。
+    """
+    if input_ids.shape != scored_mask.shape:
+        raise ValueError(
+            f'トークン {tuple(input_ids.shape)} と印 {tuple(scored_mask.shape)} '
+            'の形が違う')
+    if bool(scored_mask[:, -1].any()):
+        raise ValueError(
+            '最終列に採点位置の印がある。その位置が予測するトークンは系列の外')
+    n_sequences, width = input_ids.shape
+
+    following = torch.zeros_like(input_ids)
+    following[:, :-1] = input_ids[:, 1:]
+    targets = following[scored_mask]
+    row_index = (torch.arange(n_sequences, device=input_ids.device)
+                 .unsqueeze(1).expand(n_sequences, width)[scored_mask])
+
+    empty = [index for index, choices in enumerate(rows)
+             if not any(bool(scored_mask[row].any()) for row in choices)]
+    if empty:
+        raise ValueError(
+            f'採点位置が1つも無い問題が {len(empty)} 問ある（最初は {empty[0]}）')
+
+    width_k = max(len(choices) for choices in rows)
+    choice_rows = torch.zeros((len(rows), width_k), dtype=torch.long)
+    choice_mask = torch.zeros((len(rows), width_k), dtype=torch.bool)
+    for index, choices in enumerate(rows):
+        choice_rows[index, :len(choices)] = torch.tensor(choices,
+                                                         dtype=torch.long)
+        choice_mask[index, :len(choices)] = True
+
+    names = tuple(sorted(set(tasks)))
+    lookup = {name: number for number, name in enumerate(names)}
+    return ChoiceScoring(
+        keep=scored_mask, targets=targets, row_index=row_index,
+        choice_rows=choice_rows, choice_mask=choice_mask,
+        gold_column=torch.tensor(list(gold), dtype=torch.long),
+        task_index=torch.tensor([lookup[name] for name in tasks],
+                                dtype=torch.long),
+        task_names=names)
 
 
 @dataclass

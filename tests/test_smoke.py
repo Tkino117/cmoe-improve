@@ -112,3 +112,25 @@ def test_partial_conversion_leaves_the_rest_dense(adapter):
     assert adapter.is_converted(0)
     assert not adapter.is_converted(1)
     assert evaluate_ppl(adapter, token_set('eval', (1, SEQLEN * 2), seed=1)).ppl > 0
+
+
+def test_a_batch_chunk_wider_than_the_batch_still_moves_the_states(adapter):
+    """分割幅が系列数以上でも、載せ替えを省かない。
+
+    分割を頼まれているとき、呼ぶ側は状態をホストに置いている。1塊で済むから
+    といってそのまま層へ渡すと、系列数が分割幅を下回る校正セットでだけ
+    「重みはカード、状態はホスト」で落ちる。CPU では落ちないので、ここで見るのは
+    「分割幅を変えても同じ値が出る」ことである。
+    """
+    from cmoe.moe.modules import forward_chunked
+
+    # 中身は何でもよい。見ているのは分割の枝であって、層の実体ではない
+    hidden = adapter.model.config.hidden_size
+    torch.manual_seed(0)
+    moe = torch.nn.Linear(hidden, hidden, bias=False).to(torch.bfloat16)
+    z = torch.randn(3, SEQLEN, hidden, dtype=torch.bfloat16)
+    residual = torch.zeros_like(z)
+    wide = forward_chunked(moe, z, residual, batch_chunk=8, device='cpu')
+    narrow = forward_chunked(moe, z, residual, batch_chunk=2, device='cpu')
+    assert torch.equal(wide, narrow)
+    assert wide.device == z.device
