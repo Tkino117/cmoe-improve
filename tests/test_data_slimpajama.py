@@ -14,7 +14,8 @@ import pytest
 import torch
 
 from cmoe.data.slimpajama import (MARGIN, MIN_MARGIN, SUBSETS, allocate,
-                                  draw_component, _documents, _gather)
+                                  draw_component, _documents, _draw_set,
+                                  _gather, _pool)
 from cmoe.data.wikitext2 import intervals_overlap
 
 INTEGRATION = os.environ.get('CMOE_SLIMPAJAMA_INTEGRATION') == '1'
@@ -224,6 +225,101 @@ def test_a_denser_tokenizer_is_refused_rather_than_silently_crowded():
         draw_component(FakeTokenizer(40), texts, 128, 4, 0, 'RedPajamaGithub')
 
 
+# --- 除外と札（fit / validation を分けるための2つ）---------------------------
+
+def test_gather_without_exclusions_is_unchanged():
+    """除外が空なら、除外を持たなかったころと1つも変わらない。"""
+    texts = make_texts(50, 100)
+    plain, _ = _gather(texts, 400, random.Random('0:A'))
+    empty, _ = _gather(texts, 400, random.Random('0:A'), ())
+    assert plain == empty
+
+
+def test_gather_skips_excluded_documents():
+    """除外した番号は出ない。シャッフルは全番号の上で先に済ませてある。"""
+    texts = make_texts(50, 100)
+    first, _ = _gather(texts, 400, random.Random('0:A'))
+    rest, _ = _gather(texts, 400, random.Random('0:A'), first)
+    assert not set(first) & set(rest)
+
+
+def test_no_part_label_keeps_the_existing_stream():
+    """``part=None`` は既存の全測定が通った経路そのものである。"""
+    texts = make_texts(400, 4096)
+    plain = draw_component(FakeTokenizer(), texts, 128, 4, 0, 'RedPajamaC4')[1]
+    explicit = draw_component(FakeTokenizer(), texts, 128, 4, 0, 'RedPajamaC4',
+                              part=None)[1]
+    assert plain == explicit
+
+
+def test_a_part_label_changes_the_draw():
+    texts = make_texts(400, 4096)
+    carve = draw_component(FakeTokenizer(), texts, 128, 4, 0, 'RedPajamaC4')[1]
+    fit = draw_component(FakeTokenizer(), texts, 128, 4, 0, 'RedPajamaC4',
+                         part='fit')[1]
+    assert carve.documents != fit.documents
+    assert carve.starts != fit.starts
+
+
+def test_excluded_documents_stay_out_of_the_draw():
+    texts = make_texts(400, 4096)
+    carve = draw_component(FakeTokenizer(), texts, 128, 4, 0, 'RedPajamaC4')[1]
+    fit = draw_component(FakeTokenizer(), texts, 128, 4, 0, 'RedPajamaC4',
+                         part='fit', exclude=carve.documents)[1]
+    assert not set(carve.documents) & set(fit.documents)
+
+
+# --- _draw_set --------------------------------------------------------------
+
+def fake_pool():
+    return {name: make_texts(400, 4096) for name in SUBSETS}
+
+
+def test_the_carve_draw_survives_the_split_path():
+    """``splits`` の carve は ``calibration`` と1トークンも変わらない。
+
+    report/07 が探した配分は、この carve から作られた分割の上でしか意味を
+    持たない。ここが動いたら、既存の測定とつながらなくなる。
+    """
+    grouped = fake_pool()
+    shares = _pool(grouped)
+    used = {name: set() for name in SUBSETS}
+    calib = _draw_set(FakeTokenizer(), grouped, shares, 128, 8, 0,
+                      'calib', None)
+    carve = _draw_set(FakeTokenizer(), grouped, shares, 128, 8, 0,
+                      'carve', None, used)
+    assert torch.equal(calib.input_ids, carve.input_ids)
+
+
+def test_later_sets_avoid_the_documents_already_used():
+    grouped = fake_pool()
+    shares = _pool(grouped)
+    used = {name: set() for name in SUBSETS}
+    carve = _draw_set(FakeTokenizer(), grouped, shares, 128, 8, 0,
+                      'carve', None, used)
+    fit = _draw_set(FakeTokenizer(), grouped, shares, 128, 8, 0,
+                    'fit', 'fit', used)
+    validation = _draw_set(FakeTokenizer(), grouped, shares, 128, 8, 0,
+                           'validation', 'validation', used)
+
+    for left, right in ((carve, fit), (carve, validation), (fit, validation)):
+        for one, other in zip(left.components, right.components):
+            assert not set(one.documents) & set(other.documents)
+
+
+def test_every_set_keeps_the_stratified_quota():
+    grouped = fake_pool()
+    shares = _pool(grouped)
+    used = {name: set() for name in SUBSETS}
+    for count, part in ((8, None), (16, 'fit'), (16, 'validation')):
+        tokens = _draw_set(FakeTokenizer(), grouped, shares, 128, count, 0,
+                           'x', part, used)
+        assert tokens.n_sequences == count
+        counts = {row['name']: row['n_sequences']
+                  for row in tokens.metadata()['components']}
+        assert counts == allocate(shares, count)
+
+
 # --- _documents -------------------------------------------------------------
 
 def write_shard(path, rows):
@@ -278,3 +374,29 @@ def test_draws_a_stratified_set():
 
     other = calibration(model, 2048, 16, 1)
     assert other.metadata()['token_hash'] != meta['token_hash']
+
+
+@pytest.mark.skipif(not INTEGRATION,
+                    reason='CMOE_SLIMPAJAMA_INTEGRATION=1 で走る')
+def test_splits_keep_the_carve_and_separate_fit_and_validation():
+    """実物で、carve が calibration と一致し、3本が文書レベルで分かれる。"""
+    from cmoe.data.slimpajama import calibration, splits
+
+    model = 'meta-llama/Llama-2-7b-hf'
+    parts = splits(model, 2048, 0, carve_count=16, fit_count=64,
+                   validation_count=64)
+
+    # report/07 の測定とつながる唯一の担保
+    carve_hash = parts.carve.metadata()['token_hash']
+    assert carve_hash.startswith('37738f7c8d47')
+    assert carve_hash == calibration(model, 2048, 16, 0).metadata()['token_hash']
+
+    assert tuple(parts.fit.input_ids.shape) == (64, 2048)
+    assert tuple(parts.validation.input_ids.shape) == (64, 2048)
+
+    for left, right in ((parts.carve, parts.fit),
+                        (parts.carve, parts.validation),
+                        (parts.fit, parts.validation)):
+        for one, other in zip(left.components, right.components):
+            assert one.name == other.name
+            assert not set(one.documents) & set(other.documents)

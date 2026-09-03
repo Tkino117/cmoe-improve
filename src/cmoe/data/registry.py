@@ -79,8 +79,13 @@ CALIBRATION_SETS = {
 }
 
 # ルーター方式が要る carve / fit / validation の3本組。
+#
+# slimpajama の carve は ``slimpajama.calibration`` と1トークンも変わらない
+# （種に札を足さない経路を通す）。fit を要求する方式を足しても、分割と expert
+# 重みは calibration だけで測った run と同一のままである。
 SPLIT_SETS = {
     'wikitext2': wikitext2.splits,
+    'slimpajama': slimpajama.splits,
 }
 
 EVALUATION_SETS = {

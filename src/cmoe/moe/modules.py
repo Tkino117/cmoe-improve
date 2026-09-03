@@ -98,6 +98,8 @@ class MoE(nn.Module):
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
         y = torch.zeros_like(x)
+        if indices.dtype == torch.bool:
+            return self._forward_mask(x, weights, indices, shape)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
         if self.cus_training:
             self.gate.update_bias(counts.to(dtype=torch.bfloat16))
@@ -112,6 +114,24 @@ class MoE(nn.Module):
                 y[idx] += expert(x[idx]) * weights[idx, top, None]
             else:
                 y[idx] += expert(x[idx])
+        z = self.shared_experts(x)
+        return (y + z).view(shape)
+
+    def _forward_mask(self, x, weights, mask, shape):
+        """選択が [トークン, routed] の 0/1 で来る経路（可変 Top-K）。
+
+        トークンごとに走る expert の数が違うだけで、足し込む順（expert の番号順）
+        も重みの当て方も固定 Top-K の経路と同じである。**予算は平均でしか
+        守られない** — 1トークンだけを見れば K を超えることも下回ることもある。
+        """
+        y = torch.zeros_like(x)
+        counts = mask.sum(dim=0).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            idx = mask[:, i].nonzero(as_tuple=True)[0]
+            value = self.experts[i](x[idx])
+            y[idx] += value * weights[idx, i, None] if self.enable_scale else value
         z = self.shared_experts(x)
         return (y + z).view(shape)
 

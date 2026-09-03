@@ -44,7 +44,7 @@ import random
 
 import torch
 
-from cmoe.data.base import TokenSet, load_tokenizer
+from cmoe.data.base import Splits, TokenSet, load_tokenizer
 from cmoe.data.wikitext2 import non_overlapping_starts, take
 
 REPO = 'DKYoon/SlimPajama-6B'
@@ -149,13 +149,21 @@ def _documents(path):
     return {name: tuple(rows) for name, rows in grouped.items()}
 
 
-def _gather(texts, need, rng):
-    """文書をシャッフルし、合計が need 文字に届くまで採る。番号を返す。"""
+def _gather(texts, need, rng, exclude=()):
+    """文書をシャッフルし、合計が need 文字に届くまで採る。番号を返す。
+
+    ``exclude`` に入っている番号は飛ばす。**シャッフルは全番号の上で先に行う**
+    ので、除外が空なら除外を持たない版と1ビットも変わらない — carve の引きを
+    そのまま残したまま、その続きから fit を採るための順序である。
+    """
     order = list(range(len(texts)))
     rng.shuffle(order)
+    excluded = set(exclude)
     picked = []
     size = 0
     for index in order:
+        if index in excluded:
+            continue
         picked.append(index)
         size += len(texts[index])
         if size >= need:
@@ -163,17 +171,23 @@ def _gather(texts, need, rng):
     return tuple(picked), size
 
 
-def draw_component(tokenizer, texts, seqlen, count, seed, name):
+def draw_component(tokenizer, texts, seqlen, count, seed, name,
+                   part=None, exclude=()):
     """1成分から count 本。
 
     成分ごとに独立の種を使う。同じ seed を全成分で使い回すと、成分をまたいで
     同じ開始位置の並びが出る（成分の長さが違うので実害は小さいが、独立に
     引いたことにはならない）。``random.Random`` は文字列を sha512 で消費する
     ので、この種はプロセスや ``PYTHONHASHSEED`` に依存しない。
+
+    ``part`` は種に足す札で、``None`` のときは何も足さない。**既存の全測定が
+    通ったのは None の経路である** — ここに文字列を足すと種が変わり、引ける
+    トークンが総入れ替えになる。fit / validation はそれを承知で別の札を使う。
+    ``exclude`` は使わない文書の番号（carve が採ったもの）。
     """
-    stream = f'{seed}:{name}'
+    stream = f'{seed}:{name}' if part is None else f'{seed}:{name}:{part}'
     picked, n_chars = _gather(texts, count * seqlen * CHARS_PER_TOKEN * MARGIN,
-                              random.Random(stream))
+                              random.Random(stream), exclude)
 
     ids = tokenizer('\n\n'.join(texts[index] for index in picked),
                     return_tensors='pt').input_ids
@@ -189,6 +203,34 @@ def draw_component(tokenizer, texts, seqlen, count, seed, name):
         n_tokens=n_tokens, n_chars=n_chars)
 
 
+def _pool(grouped):
+    """成分ごとの文字数。配分規則の入力。"""
+    return {subset: sum(len(text) for text in grouped[subset])
+            for subset in SUBSETS}
+
+
+def _draw_set(tokenizer, grouped, shares, seqlen, count, seed, name, part,
+              used=None):
+    """7成分を層化して count 本引き、1つの ``TokenSet`` にする。
+
+    ``used`` を渡すと、そこに入っている文書番号を避け、採った番号を書き足す。
+    ``None`` なら誰も避けない（``calibration`` の経路）。
+    """
+    quota = allocate(shares, count)
+    rows = []
+    components = []
+    for subset in SUBSETS:
+        block, component = draw_component(
+            tokenizer, grouped[subset], seqlen, quota[subset], seed, subset,
+            part=part, exclude=() if used is None else used[subset])
+        rows.append(block)
+        components.append(component)
+        if used is not None:
+            used[subset] = used[subset] | set(component.documents)
+    return TokenSet(name, torch.cat(rows, dim=0),
+                    components=tuple(components))
+
+
 def calibration(model, seqlen, n_samples, seed, name='slimpajama'):
     """7成分を層化して引いた n_samples 本。
 
@@ -201,16 +243,39 @@ def calibration(model, seqlen, n_samples, seed, name='slimpajama'):
     """
     tokenizer = load_tokenizer(model)
     grouped = _documents(_shard_path())
-    shares = {subset: sum(len(text) for text in grouped[subset])
-              for subset in SUBSETS}
-    quota = allocate(shares, n_samples)
+    return _draw_set(tokenizer, grouped, _pool(grouped), seqlen, n_samples,
+                     seed, f'{name}-train-calib', None)
 
-    rows = []
-    components = []
-    for subset in SUBSETS:
-        block, component = draw_component(
-            tokenizer, grouped[subset], seqlen, quota[subset], seed, subset)
-        rows.append(block)
-        components.append(component)
-    return TokenSet(f'{name}-train-calib', torch.cat(rows, dim=0),
-                    components=tuple(components))
+
+def splits(model, seqlen, seed, carve_count=8, fit_count=64,
+           validation_count=64, name='slimpajama'):
+    """carve / fit / validation の3本。ルーター方式を作るのに要る。
+
+    **carve は ``calibration(model, seqlen, carve_count, seed)`` と1トークンも
+    違わない。** 種に札を足さず、避ける文書も無い経路をそのまま通るためである
+    （``draw_component`` の ``part=None``）。これは飾りではなく要件で、
+    report/07 が探した層ごとの配分は、この carve から作られた分割の上でしか
+    意味を持たない。守れているかは token hash で確かめられる。
+
+    fit と validation は別の札の種で引き、**carve が採った文書を丸ごと避ける**。
+    wikitext2 の分割は窓の重なりだけを避けるが、ここは母集団が成分ごとに
+    小さいので文書の単位で分ける。fit は validation の文書も avoid されて
+    いない（fit を先に引くので、validation が fit を避ける向きになる）。
+
+    **validation も訓練側のシャードから引く。** wikitext2 は corpus に
+    validation split があるのでそちらから切れるが、SlimPajama-6B の1シャードに
+    その区別は無い。診断にしか使わない量なので、carve / fit と文書が重ならない
+    ことだけを保証する。
+    """
+    tokenizer = load_tokenizer(model)
+    grouped = _documents(_shard_path())
+    shares = _pool(grouped)
+    used = {subset: set() for subset in SUBSETS}
+    carve = _draw_set(tokenizer, grouped, shares, seqlen, carve_count, seed,
+                      f'{name}-train-carve', None, used)
+    fit = _draw_set(tokenizer, grouped, shares, seqlen, fit_count, seed,
+                    f'{name}-train-fit', 'fit', used)
+    validation = _draw_set(tokenizer, grouped, shares, seqlen,
+                           validation_count, seed,
+                           f'{name}-train-validation', 'validation', used)
+    return Splits(carve=carve, fit=fit, validation=validation)

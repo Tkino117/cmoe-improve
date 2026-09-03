@@ -26,8 +26,17 @@ from cmoe.router.methods.oracle_correlation import (activation, flatten_z,
 
 
 def _router_scores(router, z):
+    """そのルーターが Top-K を決めるのに読んでいる score。
+
+    代表ニューロン型（方式1〜5）は gate と classifier の積で決まるが、それ以外の
+    族は自分の形を知っているので ``routing_scores`` で名乗る。相関の欄が
+    「そのルーターが実際に見ている量」であることが、族をまたいでも保たれる。
+    """
+    scores = getattr(router, 'routing_scores', None)
+    if scores is not None:
+        return scores(z).float()
     if not hasattr(router, 'gate') or not hasattr(router, 'classifier'):
-        raise TypeError('この診断は代表ニューロン型のルーターを前提にしている')
+        raise TypeError('score を名乗らないルーターは診断にかけられない')
     return (router.classifier(z) * F.silu(router.gate(z))).abs().float()
 
 
@@ -66,6 +75,7 @@ def evaluate_routers_against_abs_oracle(routers, z, expert_groups, gate_weight,
             'recovered': 0.0,
             'overlap': 0,
             'exact': 0,
+            'n_selected': 0,
             'counts': torch.zeros(n_routed, dtype=torch.int64),
             'sum_x': torch.zeros(n_routed, dtype=torch.float64, device=device),
             'sum_x2': torch.zeros(n_routed, dtype=torch.float64, device=device),
@@ -108,23 +118,42 @@ def evaluate_routers_against_abs_oracle(routers, z, expert_groups, gate_weight,
         max_y.copy_(torch.maximum(max_y, routed.amax(dim=0)))
 
         oracle_sets = oracle_indices.sort(dim=1).values
+        oracle_mask = torch.zeros_like(routed, dtype=torch.bool)
+        oracle_mask.scatter_(1, oracle_indices, True)
         for name, router in routers.items():
-            weights, indices = router(chunk)
-            if tuple(indices.shape) != (chunk.shape[0], topk):
-                raise ValueError(f'{name} が返した選択の形が {tuple(indices.shape)}')
+            weights, selection = router(chunk)
             if not torch.equal(weights, torch.ones_like(weights)):
                 raise ValueError(f'{name} が expert の出力重みを変えている')
-            if indices.numel() and (int(indices.min()) < 0 or int(indices.max()) >= n_routed):
-                raise ValueError(f'{name} が範囲外の expert を選んだ')
-            selected = routed.gather(1, indices).sum(dim=1)
             state = states[name]
+            if selection.dtype == torch.bool:
+                # 可変 Top-K。集合の大きさがトークンごとに違うので、
+                # 「何個走ったか」も一緒に数える。recall の分母は予算 K の
+                # ままにしてある — 予算を超えて選べば上がるのが正しい
+                if tuple(selection.shape) != (chunk.shape[0], n_routed):
+                    raise ValueError(
+                        f'{name} が返した選択の形が {tuple(selection.shape)}')
+                selected = (routed * selection).sum(dim=1)
+                state['exact'] += int(
+                    (selection == oracle_mask).all(dim=1).sum())
+                state['overlap'] += int((selection & oracle_mask).sum())
+                state['counts'].add_(selection.sum(dim=0).cpu())
+                state['n_selected'] += int(selection.sum())
+            else:
+                if tuple(selection.shape) != (chunk.shape[0], topk):
+                    raise ValueError(
+                        f'{name} が返した選択の形が {tuple(selection.shape)}')
+                if selection.numel() and (int(selection.min()) < 0
+                                          or int(selection.max()) >= n_routed):
+                    raise ValueError(f'{name} が範囲外の expert を選んだ')
+                selected = routed.gather(1, selection).sum(dim=1)
+                sorted_indices = selection.sort(dim=1).values
+                state['exact'] += int((sorted_indices == oracle_sets).all(dim=1).sum())
+                overlap = (selection[:, :, None] == oracle_indices[:, None, :])
+                state['overlap'] += int(overlap.any(dim=2).sum())
+                state['counts'].add_(
+                    torch.bincount(selection.flatten().cpu(), minlength=n_routed))
+                state['n_selected'] += int(selection.numel())
             state['recovered'] += float((shared + selected).sum(dtype=torch.float64))
-            sorted_indices = indices.sort(dim=1).values
-            state['exact'] += int((sorted_indices == oracle_sets).all(dim=1).sum())
-            overlap = (indices[:, :, None] == oracle_indices[:, None, :])
-            state['overlap'] += int(overlap.any(dim=2).sum())
-            state['counts'].add_(
-                torch.bincount(indices.flatten().cpu(), minlength=n_routed))
             scores = _router_scores(router, chunk)
             state['sum_x'].add_(scores.sum(dim=0, dtype=torch.float64))
             state['sum_x2'].add_(scores.square().sum(dim=0, dtype=torch.float64))
@@ -158,6 +187,9 @@ def evaluate_routers_against_abs_oracle(routers, z, expert_groups, gate_weight,
             'oracle_r': oracle_recovered / total,
             'oracle_mean_recall': state['overlap'] / (n_tokens * topk),
             'oracle_exact_set_rate': state['exact'] / n_tokens,
+            # 可変 Top-K のルーターでは K と一致しない。予算が守られている
+            # かどうかは、比較が成立する条件そのものなので必ず残す
+            'mean_selected': state['n_selected'] / n_tokens,
             'n_selected_per_expert': state['counts'].tolist(),
             'representative_mass_correlations': correlations,
             'mean_representative_mass_correlation': (

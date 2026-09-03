@@ -17,6 +17,8 @@ from cmoe.assemble import Converter, install_routers
 from cmoe.carve.registry import create_carver
 from cmoe.data.base import TokenSet
 from cmoe.eval.ppl import evaluate_ppl
+from cmoe.router.methods.dynamic_topk import (load_histogram, mean_load,
+                                             reset_load)
 from cmoe.router.registry import create_method, resolve_chain
 
 # A < N なので Top-K が routed 数より小さくなる（方式4 の探索が動く条件）
@@ -246,3 +248,117 @@ def test_resolve_chain_puts_the_frozen_source_first():
     assert resolve_chain(['score_calibration']) == [
         'cmoe', 'freq_centroid', 'oracle_correlation', 'oracle_recovery',
         'score_calibration']
+
+
+def test_spectral_mass_reports_no_representative_and_is_diagnosable(adapter):
+    """方式7 は実在ニューロンの行を持たないが、score を名乗るので診断に載る。"""
+    report = convert(adapter, ['spectral_mass'])
+
+    assert report.router_methods == ('cmoe', 'spectral_mass')
+    for record in report.layers:
+        assert record.representatives['spectral_mass'] is None
+        # 代表を持たない方式でも、回収率とオラクル一致は測れる
+        values = record.diagnostics['spectral_mass']
+        assert values['router_r'] <= values['oracle_r'] + 1e-9
+        assert 0.0 <= values['oracle_exact_set_rate'] <= 1.0
+
+
+def test_spectral_mass_selects_topk_without_touching_expert_weights(adapter):
+    report = convert(adapter, ['spectral_mass'], diagnostics=False)
+
+    for index, router in enumerate(report.routers['spectral_mass']):
+        moe = adapter.layers[index].mlp
+        x = torch.randn(5, moe.dim, dtype=torch.bfloat16)
+        weights, indices = router(x)
+        assert indices.shape == (5, moe.gate.topk)
+        # ルーターは選ぶだけで、expert の出力の重みを変えない
+        assert torch.equal(weights, torch.ones_like(weights))
+        assert int(indices.min()) >= 0 and int(indices.max()) < moe.n_routed_experts
+
+
+def test_spectral_mass_rank_can_be_named_per_router(adapter):
+    """``spectral_mass:<rank>`` は1回の変換の中に rank 違いを並べるためにある。"""
+    report = convert(adapter, ['spectral_mass:2', 'spectral_mass:8'],
+                     diagnostics=False)
+
+    assert report.router_methods == ('cmoe', 'spectral_mass:2', 'spectral_mass:8')
+    for index in range(adapter.n_layers):
+        small = report.routers['spectral_mass:2'][index]
+        large = report.routers['spectral_mass:8'][index]
+        assert small.rank == 2 and large.rank == 8
+
+
+def test_dynamic_topk_keeps_the_budget_on_average(adapter):
+    """可変 Top-K は1トークンでは K を守らないが、平均では守る。"""
+    report = convert(adapter, ['dynamic_cmoe'])
+
+    for record in report.layers:
+        values = record.diagnostics['dynamic_cmoe']
+        # 校正で決めたしきい値を、別の系列（validation）に当てた実測
+        assert abs(values['mean_selected'] - record.topk) < 0.5
+        # 固定 Top-K の対照はきっかり K である
+        assert abs(record.diagnostics['cmoe']['mean_selected'] - record.topk) < 1e-9
+        # 回収率がどちらに動くかはここでは見ない。可変 K が得をするのは
+        # 「score の絶対値がそのトークンの要求量を表している」ときで、それは
+        # 学習済みモデルの性質であって、方式の契約ではない（この極小モデルは
+        # 乱数で作っており、実際に下がる）
+
+
+def test_dynamic_topk_selection_is_a_mask_and_runs_through_the_moe(adapter):
+    report = convert(adapter, ['dynamic_cmoe'], diagnostics=False)
+    install_routers(adapter, report.routers['dynamic_cmoe'])
+    value = evaluate_ppl(adapter, token_set('eval', (1, SEQLEN * 2), seed=1)).ppl
+
+    assert value > 0 and math.isfinite(value)
+    for index, router in enumerate(report.routers['dynamic_cmoe']):
+        moe = adapter.layers[index].mlp
+        weights, mask = router(torch.randn(7, moe.dim, dtype=torch.bfloat16))
+        assert mask.dtype == torch.bool
+        assert mask.shape == (7, moe.n_routed_experts)
+        assert torch.equal(weights, torch.ones_like(weights))
+        assert router.selection['fit_mean_k'] == pytest.approx(router.topk, abs=0.5)
+
+
+def test_dynamic_topk_floor_guarantees_a_minimum(adapter):
+    report = convert(adapter, ['dynamic_cmoe:1'], diagnostics=False)
+
+    for index, router in enumerate(report.routers['dynamic_cmoe:1']):
+        moe = adapter.layers[index].mlp
+        _, mask = router(torch.randn(9, moe.dim, dtype=torch.bfloat16))
+        assert int(mask.sum(dim=1).min()) >= 1
+
+
+def test_load_is_summed_across_layers_with_different_routed_counts(adapter):
+    """層ごとに routed の本数が違っても、走った数を足し合わせられる。
+
+    配分 x を層ごとに変えると routed は N - x_ℓ 本になり、数え上げの幅が層で
+    変わる。一様配分でしか通らない書き方だと、ここで形が合わずに落ちる
+    （実験20 の探索配分がそれを踏んだ）。
+    """
+    methods = [create_method(name) for name in resolve_chain(['dynamic_cmoe'])]
+    converter = Converter(
+        adapter, create_carver('cmoe', N_EXPERTS), methods,
+        n_experts=N_EXPERTS, fit_batch_chunk=2, token_chunk=32)
+    allocation = Allocation((1, 2), name='mixed', n_active_total=N_ACTIVE)
+    report = converter.convert(
+        token_set('calib', (2, SEQLEN)), allocation,
+        fit=token_set('fit', (2, SEQLEN), seed=2))
+
+    routers = report.routers['dynamic_cmoe']
+    widths = {router.load_histogram.numel() for router in routers}
+    assert len(widths) > 1, '幅が揃っていてはこの試験にならない'
+
+    install_routers(adapter, routers)
+    reset_load(routers)
+    evaluate_ppl(adapter, token_set('eval', (1, SEQLEN * 2), seed=1))
+
+    shape = load_histogram(routers)
+    assert len(shape) == max(widths)
+    assert sum(shape) == pytest.approx(1.0)
+    # 短い層は、自分が持てない k に票を入れない
+    assert shape[-1] > 0
+
+    # 予算と比べる相手は「K>0 の層だけで平均した K」である
+    budget = sum(allocation.topk(index)
+                 for index in range(adapter.n_layers)) / len(routers)
+    assert mean_load(routers) == pytest.approx(budget, abs=0.5)

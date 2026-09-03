@@ -366,10 +366,14 @@ class Converter:
                 initial_sets.append(row)
 
         if validation_z is not None:
-            # 代表ニューロン型のルーターだけを診断にかける。診断用オラクルは
-            # gate / classifier を持たないので自然に外れる
-            diagnostic = {name: router for name, router in routers.items()
-                          if hasattr(router, 'gate') and hasattr(router, 'classifier')}
+            # score を名乗れるルーターだけを診断にかける。代表ニューロン型は
+            # gate / classifier の積がその score で、それ以外の族は
+            # ``routing_scores`` で名乗る。診断用オラクルはどちらも持たない
+            # ので自然に外れる
+            diagnostic = {
+                name: router for name, router in routers.items()
+                if hasattr(router, 'routing_scores')
+                or (hasattr(router, 'gate') and hasattr(router, 'classifier'))}
             if diagnostic:
                 record.diagnostics = evaluate_routers_against_abs_oracle(
                     diagnostic, validation_z, partition.expert_groups,

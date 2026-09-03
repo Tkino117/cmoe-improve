@@ -56,6 +56,8 @@ from cmoe.eval import bench, bench_stats
 from cmoe.eval.ppl import evaluate_ppl
 from cmoe.eval.stats import paired_differences, stratified_paired_bootstrap
 from cmoe.router.diagnostics import gap_recovered
+from cmoe.router.methods.dynamic_topk import (load_histogram, mean_load,
+                                             reset_load)
 from cmoe.router.methods.score_calibration import GAIN_LIMIT
 from cmoe.router.registry import create_method, resolve_chain
 
@@ -153,6 +155,8 @@ def build_parser():
                      help='方式5 の gain の探索幅（1/x 〜 x）')
     run.add_argument('--no-bias', action='store_true',
                      help='方式5 の offset 段を走らせない（gain だけ合わせる）')
+    run.add_argument('--spectral-rank', type=int, default=None,
+                     help='方式7 の低ランク近似の rank（expert ごと・gate/up 別）')
     run.add_argument('--max-sweeps', type=int, default=10,
                      help='方式4 の座標上昇の掃引上限')
     run.add_argument('--profile-positions', default='all',
@@ -263,14 +267,24 @@ def add_oracle_arguments(parser, layers_help):
 
 
 def configure_method(method, args):
-    """CLI の分割幅を方式へ渡す。方式ごとの分岐ではなく、持っていれば設定する。"""
+    """CLI の分割幅を方式へ渡す。方式ごとの分岐ではなく、持っていれば設定する。
+
+    名前にパラメータを添えた方式（``spectral_mass:64``）は、その値を CLI の
+    既定で上書きしない。1回の変換の中に rank 違いを並べたときに、全部が同じ
+    rank になってしまうため。
+    """
+    named_variant = ':' in getattr(method, 'name', '')
     for name, value in (('chunk_size', args.token_chunk),
+                        ('rank', args.spectral_rank),
                         ('keep_top', args.keep_top),
                         ('max_sweeps', args.max_sweeps),
                         ('gain_limit', args.gain_limit),
                         ('fit_bias', not args.no_bias)):
-        if hasattr(method, name):
-            setattr(method, name, value)
+        if value is None or not hasattr(method, name):
+            continue
+        if named_variant and name == getattr(type(method), 'variant_attribute', None):
+            continue
+        setattr(method, name, value)
     if hasattr(method, 'token_chunk'):
         method.token_chunk = args.search_token_chunk
     return method
@@ -352,17 +366,25 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
         log(f'  診断 {name:<20} R={values["router_r"]:.6f} '
             f'gap回収={values["gap_recovered"]:.2%} '
             f'recall={values["oracle_mean_recall"]:.4f} '
-            f'一致率={values["oracle_exact_set_rate"]:.4f}')
+            f'一致率={values["oracle_exact_set_rate"]:.4f} '
+            f'平均K={values["mean_selected"]:.3f}')
 
     results = {}
+    # 可変 Top-K の方式が、評価データの上でも予算を守っているか。校正で決めた
+    # しきい値が校正の外でずれれば、比較そのものが成立しない
+    realized_load = {}
     if not args.no_ppl:
         for name in router_names:
             install_routers(adapter, report.routers[name])
             results[name] = {}
             for dataset, token_set in evaluation_sets.items():
+                reset_load(report.routers[name])
                 result = evaluate_ppl(adapter, token_set)
                 results[name][dataset] = result
-                log(f'  {name:<20} {dataset:<10} {result.ppl:.6f}')
+                load = mean_load(report.routers[name])
+                realized_load[f'{name}/{dataset}'] = load
+                suffix = '' if load is None else f' 平均K={load:.3f}'
+                log(f'  {name:<20} {dataset:<10} {result.ppl:.6f}{suffix}')
 
     bench_samples = {}
     if args.bench:
@@ -371,6 +393,7 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
             # PPL を測らなかった経路でもルーターは載せる必要がある
             install_routers(adapter, report.routers[name])
             adapter.to_device()
+            reset_load(report.routers[name])
             started_bench = time.time()
             bench_samples[name] = bench.evaluate_bench(
                 adapter.model, tokenizer,
@@ -378,6 +401,13 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
                 batch_size=args.bench_batch_size, limit=args.bench_limit,
                 num_fewshot=args.bench_fewshot, max_length=bench_max_length(args),
                 cache_dir=args.bench_cache_dir or None, model_name=args.model)
+            load = mean_load(report.routers[name])
+            realized_load[f'{name}/bench'] = load
+            if load is not None:
+                shape = load_histogram(report.routers[name])
+                realized_load[f'{name}/bench_histogram'] = shape
+                spread = ' '.join(f'{value:.3f}' for value in shape)
+                log(f'  {name:<20} {"bench 平均K":<16} {load:.4f} 分布 [{spread}]')
             rows = bench_stats.summarize(bench_samples[name])
             for task, values in rows['tasks'].items():
                 log(f'  {name:<20} {task:<16} acc={values["acc"]:.4f} '
@@ -401,6 +431,7 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
         },
         'conversion': report.as_dict(),
         'diagnostics': diagnostics,
+        'realized_load': realized_load,
         'ppl': {name: {dataset: result.as_dict()
                        for dataset, result in rows.items()}
                 for name, rows in results.items()},
@@ -442,6 +473,10 @@ def summarize_diagnostics(report):
                 value['oracle_mean_recall'] for value in values) / len(values),
             'oracle_exact_set_rate': sum(
                 value['oracle_exact_set_rate'] for value in values) / len(values),
+            # 可変 Top-K の方式では、これが予算 K と揃っているかが比較の前提に
+            # なる。routing する層の平均で、層ごとの値は conversion の中にある
+            'mean_selected': sum(
+                value['mean_selected'] for value in values) / len(values),
             'n_routing_layers': len(values),
         }
     return summary

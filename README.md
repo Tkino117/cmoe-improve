@@ -93,7 +93,14 @@ tests/        CPU で数秒で回る動作確認
 - アダプタ: `llama`（既存の測定を再現する経路）、`auto`（同じ層構造の他モデル）
 - ルーター方式: 現行 CMoE、頻度重心、Oracle 相関、回収率の共同最適化、
   score 校正（代表を凍結し expert ごとの gain と offset を座標上昇で合わせる）、
-  expert 平均（素/centered）、診断用 `|h|` オラクル
+  expert 平均（素/centered）、診断用 `|h|` オラクル、
+  `spectral_mass`（代表ニューロン1本をやめ、expert の活性質量を重み行列の低ランク
+  近似 `‖silu(G_e x)‖·‖U_e x‖` で見積もる。`spectral_mass:64` で rank を指定。
+  白色化を切った `spectral_plain`、校正を一切読まない `spectral_weight` もある）、
+  `dynamic_cmoe` / `dynamic_spectral`（固定 Top-K をやめ、score のしきい値1個で
+  選ぶ。平均だけを予算に合わせるので、`dynamic_cmoe` は追加の積和がゼロ。
+  評価データの上で実際に走った expert 数は `summary.json` の `realized_load` に
+  残る）
 - ルーター診断: `|h|` 回収率、Oracle gap 回収率、Top-K の recall と完全一致率
 - 採点オラクル: `mass`（活性質量の回収率）、`mass_squared`、`local_error`（層の
   出力誤差 L）、`suffix_kl`（残りを dense のまま走らせた出力分布の KL）、
@@ -108,6 +115,14 @@ tests/        CPU で数秒で回る動作確認
   「どの位置で切り分けるか」と「どの位置で採点するか」を別々に動かせる
 - 配分の探索: `beam`（幅を指定）、`greedy`（幅1のビームそのもの）。探索を
   走らせずに配分を採点するだけの `cmoe score` もある（対照を校正で選ぶため）
+- 配分の対照（先行研究を配分軸だけ移したもの。**どれも提案手法ではない**）:
+  `alloc/ew_rule.py`（ExpertWeaver の式4・5・6。report/21）、
+  `alloc/owl.py`（OWL の外れ値比率）、
+  `alloc/score_rule.py`（層別スカラー → x の写像。EW と OWL の共通の器）、
+  `alloc/lexi.py`（LExI の感度プロファイル。層ローカル誤差の独立な argmin）、
+  `alloc/order.py`（順序対照。配分の多重集合を保ったまま層の並びだけ崩す）。
+  統計を作るのは `experiments/22_alloc_baselines/{owl,lexi}_probe.py` で、
+  そこから先の写像は CPU だけで足りる
 - 評価: PPL と、選択問題ベンチマーク5タスク（`--bench`）
 
 ### 選択問題ベンチマーク
