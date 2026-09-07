@@ -28,12 +28,10 @@ Mistral は Llama より1割ほど遅い。**合計およそ110時間、4枚に�
   minor version compatibility に頼っている。測定先の 535.309.01（CUDA 12.2）は
   満たしている。版そのものは `nvidia-smi` で見る。実際に動くかは手順2 で確かめる
 - Docker と NVIDIA Container Toolkit（`docker run --gpus` が通ること）
-- HuggingFace のモデルを引けること。**Llama-2 は gated なので、ホスト側で
-  `huggingface-cli login` を1回通しておく**（`~/.cache/huggingface/token` に
-  書かれ、マウント経由でコンテナに入る）。`HF_TOKEN` を環境変数で持っている
-  なら `source scripts/docker-env.sh` がそれを拾って渡す。通っていないと
-  preflight のモデルとデータセットが両方落ちる（校正が Llama のトークナイザを
-  引くので、原因は1つでも2件に見える）
+- HuggingFace のモデルを引けること。**Llama-2 は gated** なので、手順2 のあとに
+  `cmoe_login` を1回通す（下記）。通っていないと preflight のモデルと
+  データセットが両方落ちる — 校正が Llama のトークナイザを引くので、**原因は
+  1つでも2件に見える**
 - ディスク 100GB ほど（モデル28GB + データセット + 一次データ）
 
 ## 手順1 イメージを作る
@@ -69,7 +67,24 @@ cmoe_env                       # 設定を確認する
 |---|---|
 | `cmoe1 <コマンド>` | **GPU 1枚だけ見せる。** 手順3 の smoke、手順4、手順5 はこれ |
 | `cmoeall <コマンド>` | 全部見せる。**preflight だけ**（枚数を数えるのが仕事なので絞らない） |
+| `cmoe_login` | HuggingFace にログインする（最初に1回） |
 | `cmoe_sweep` | 手順6 の常駐コンテナを起こす |
+
+### HuggingFace のログイン（最初に1回）
+
+```
+cmoe_login
+```
+
+**ホストには何も入れなくてよい。** CLI はコンテナの venv にあり、
+`~/.cache/huggingface` を read-write でマウントしているので、**中で書いた
+トークンはホスト側のファイルに残る**（コンテナを捨てても消えない）。次回以降は
+不要。
+
+`HF_TOKEN` を環境変数で持っているなら、`source` がそれを拾って渡すのでログインは
+いらない。**設定されているときだけ渡す** — 空のまま渡すとファイル側のトークンを
+上書きして、かえって認証が通らなくなる。いまどちらを使うかは `cmoe_env` の
+`AUTH` 行で分かる。
 
 **シェルを開き直すたびに `source` し直すこと。** 28時間の実行中に再接続したら、
 もう一度読んでから `docker logs` を見にいく。

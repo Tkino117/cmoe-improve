@@ -36,6 +36,15 @@ cmoe1() {
         $CMOE_MOUNTS $CMOE_AUTH "$CMOE_IMAGE" "$@"
 }
 
+# HuggingFace にログインする。**ホストに何も入れなくてよい** — CLI はコンテナの
+# venv にあり、~/.cache/huggingface を read-write でマウントしているので、
+# 中で書いたトークンはホスト側のファイルに残る（コンテナを捨てても消えない）。
+# 対話的に訊かれるので -it が要る。GPU も要らない
+cmoe_login() {
+    docker run --rm -it $CMOE_MOUNTS "$CMOE_IMAGE" \
+        uv run huggingface-cli login "$@"
+}
+
 # 全部見せる。**preflight だけ。** 枚数を数えるのが仕事なので絞らない
 cmoeall() {
     docker run --rm --name "$CMOE_NAME" --gpus all $CMOE_MOUNTS $CMOE_AUTH "$CMOE_IMAGE" "$@"
