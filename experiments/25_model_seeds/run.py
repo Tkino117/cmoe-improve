@@ -26,19 +26,23 @@ report/06（25%）と report/07（50%）は Llama-2-7b を seed 3本で回した
 対してやっていることを、最初から同じスクリプトの中でやる。**PPL は段3 で
 測ってあるので段4 は ``--no-ppl``** である。
 
-dense の基準はモデルごとに1つ。Llama は report/04（5タスク）と experiments/17
-（MMLU）が測ったものを取り込む。他のモデルは A=6 / seed 0 の実行の中で1回だけ
-測り、残りは全部それを取り込む（dense は A にも校正にも seed にも配分にも
-依らない）。
+**dense はモデルごとに1つで、``--check`` が測ったものに一本化する。** 旧マシンで
+測った Llama の dense（report/04 と experiments/17）は取り込まない — 5 seed を
+1台で測り直す方針なので、基準だけ別のハードウェアのものになるのを避ける。
+check を先に通しておけば (モデル × A × seed) のジョブは互いに何も待たずに
+走れる。通していないと A=6 / seed 0 だけが dense を持ち、残りはそれを待つ。
 
   # 経路の確認（3層・8問。数分）
   uv run python experiments/25_model_seeds/run.py --model mistral-7b --smoke
 
-  # 変換前後が妥当な acc を出すかの確認（dense と uniform3 だけ。1時間弱）
+  # dense と、変換前後が妥当な acc を出すかの確認（モデルごとに1回。35分ほど）
   uv run python experiments/25_model_seeds/run.py --model mistral-7b --check
 
-  # 本実行
+  # 本実行を1本
   uv run python experiments/25_model_seeds/run.py --model mistral-7b --nactive 6 --seed 0
+
+  # 20本を4枚の GPU に配る（sweep.py を見ること）
+  uv run python experiments/25_model_seeds/sweep.py --gpus 0,1,2,3
 """
 
 import argparse
@@ -72,15 +76,18 @@ MODELS = {
     'mistral-7b': 'mistralai/Mistral-7B-v0.1',
 }
 # 出力先の名前に札が入らないモデル。report/06・07 の頃の名前を保つためで、
-# seed 3・4 を足したときに既存の seed 0..2 と同じ並びに落ちる
+# 既存の seed 0..2 と同じ並びに落ちる
 UNTAGGED_MODEL = 'llama2-7b'
-# 既に測ってある dense。ここに無いモデルは A=6 / seed 0 の実行の中で1回測る
-KNOWN_DENSE = {
-    ('llama2-7b', 'bench'): 'result_logs/bench_h4/wikitext2_seed0/bench/dense.json',
-    ('llama2-7b', 'mmlu'): 'result_logs/bench_mmlu_slimpajama_seed0/bench/dense.json',
-}
-# dense を測る動作点と seed。ここ以外は全部これを取り込む
+# dense を測る動作点と seed。``--check`` を先に通していないときの測る側である
 DENSE_AT = (6, 0)
+
+# **旧マシンで測った dense は取り込まない。** report/04 の
+# ``bench_h4/wikitext2_seed0`` と report/17 の ``bench_mmlu_slimpajama_seed0``
+# には Llama の dense があるが、どちらも RTX PRO 5000 Blackwell / cu128 で
+# 測ったものである。5 seed を1台のマシンで測り直す方針にしたので、これらを
+# 取り込むと基準だけが別のハードウェアのものになる。GPU をまたぐと浮動小数の
+# 積み方が変わり、ここで見ている効果量（acc で 0.005〜0.012）と同じ桁の差が
+# 出かねない。取り込み先は ``--check`` が測ったものに一本化する。
 
 # 結果を変えない引数（出力先・チャンク幅・基準の取り込み元）。同じ実験かの判定から外す
 NOT_IDENTITY = {'out', 'batch_chunk', 'token_chunk', 'search_token_chunk',
@@ -200,29 +207,41 @@ def uniform_specs(n_active):
                          if f'uniform{x}' != baseline]
 
 
+def check_dense(model_key, kind):
+    """``--check`` が測った dense の置き場所。"""
+    prefix = 'bench' if kind == 'bench' else 'bench_mmlu'
+    name = f'{prefix}_{stem(model_key, DENSE_AT[0])}_seed{DENSE_AT[1]}'
+    return ROOT / 'result_logs' / 'exp25_check' / name / 'bench' / 'dense.json'
+
+
 def dense_reference(root, model_key, kind, n_active, seed):
     """取り込む dense。無ければ None（その実行が自分で測る）。
 
     kind は ``bench``（5タスク）か ``mmlu``。**タスクの顔ぶれが違うと
     ``cmoe run`` が取り込みを断る**ので、2つを別に持つ。
 
-    探し先は3つある。既に測ってあるもの（``KNOWN_DENSE``）→ 本実行の
-    A=6 / seed 0 → ``--check`` が測ったもの、の順である。**check は全件で
-    測る**ので、その dense は本実行がそのまま取り込める（MMLU の dense は
-    14,042問で1時間強かかるので、2度測る意味が無い）。取り込んでよいかの
-    判定は ``cmoe run`` 自身がやる — モデル・タスク・limit が違えば断る。
+    **``--check`` が測ったものを最優先に取り込む。** これが並列実行の要である。
+    check を先に1回通しておけば、(モデル × A × seed) のジョブは互いに何も
+    待たずに走れる。check を通していないと、A=6 / seed 0 だけが dense を持ち、
+    残りのジョブはそれを待つ — 4枚の GPU に投げると seed 0 以外が
+    「dense の基準が要る」で即死する。
+
+    dense は変換していないモデルなので A にも校正にも seed にも配分にも
+    依らない。取り込んでよいかの判定は ``cmoe run`` 自身がやる（モデル・
+    タスク・shot・limit が違えば断る）ので、緩めても安全側が保たれる。
     """
-    known = KNOWN_DENSE.get((model_key, kind))
-    if known is not None:
-        return ROOT / known
+    # check 自身の実行がここで自分を指すことになるが、それは ``bench_stage`` が
+    # 「出力先が参照元の親」で弾く。ここで root を見て弾こうとすると、本実行の
+    # root（``result_logs``）が check の親でもあるので、拾えるはずの dense まで
+    # 落としてしまう
+    from_check = check_dense(model_key, kind)
+    if from_check.exists():
+        return from_check
     prefix = 'bench' if kind == 'bench' else 'bench_mmlu'
     name = f'{prefix}_{stem(model_key, DENSE_AT[0])}_seed{DENSE_AT[1]}'
     if (n_active, seed) != DENSE_AT:
+        # check が無いときの直列の経路。A=6 / seed 0 が先に済んでいる前提
         return root / name / 'bench' / 'dense.json'
-    # ここが測る側だが、check が先に全件で測っていればそれを使う
-    from_check = ROOT / 'result_logs' / 'exp25_check' / name / 'bench' / 'dense.json'
-    if root != from_check.parents[2] and from_check.exists():
-        return from_check
     return None
 
 
@@ -339,7 +358,9 @@ def bench_stage(root, plan, seed, searched, kind='bench'):
         if not reference.exists():
             raise SystemExit(
                 f'{reference} が無い。dense の基準が要る。'
-                f'{plan["model"]} は A={DENSE_AT[0]} / seed {DENSE_AT[1]} を先に通すこと')
+                f'並列で回すなら先に '
+                f'`--model {plan["model"]} --check` を1回通すこと'
+                f'（これで全ジョブが待ち無しで走れる）')
         argv += ['--bench-reference', str(reference)]
         log(f'  dense は {reference} から取り込む')
     else:
