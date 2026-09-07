@@ -1,5 +1,12 @@
-# 実験を回すための像。GPU 1枚につき1コンテナを立て、experiments/25 のジョブを
-# 配る（experiments/25_model_seeds/sweep.py）。
+# 実験を回すための像。**1コンテナに GPU を全部見せ、その中の
+# experiments/25_model_seeds/sweep.py が1ジョブ1枚で配る。** 1枚1コンテナに
+# すると、各コンテナの sweep.py が同じ未完ジョブ一覧を作って同じジョブを
+# 同時に走らせる。手順は docs/05_running-the-sweep.md にある。
+#
+# **sweep.py 以外（--check / --smoke / dense_ppl.py）は必ず1枚に絞ること。**
+# アダプタは device_map='auto' で読むので、2枚以上見えていると7Bが分割され、
+# その実行が測る値だけが別のデバイス構成のものになる。run.py の
+# require_single_gpu() が止めるが、-e CUDA_VISIBLE_DEVICES=0 を付けて呼ぶ。
 #
 # **CUDA を像に入れない。** torch のホイールが CUDA ランタイムを同梱している
 # ので、要るのはホスト側のドライバだけである。nvidia/cuda ベースを敷くと、

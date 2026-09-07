@@ -48,6 +48,7 @@ check を先に通しておけば (モデル × A × seed) のジョブは互い
 import argparse
 import itertools
 import json
+import os
 import subprocess
 import sys
 import time
@@ -96,6 +97,37 @@ NOT_IDENTITY = {'out', 'batch_chunk', 'token_chunk', 'search_token_chunk',
 
 def log(message=''):
     print(message, flush=True)
+
+
+def require_single_gpu():
+    """見えている GPU が1枚であることを確かめる。
+
+    アダプタは ``device_map='auto'`` で読むので、**2枚以上見えていると
+    accelerate が7Bを分割する**。ジョブが1枚に閉じないので並列にならず、
+    それ以上に困るのは dense である — ``--check`` を4枚見える状態で回すと、
+    20ジョブ全部が取り込む基準だけが別のデバイス構成で測られる。効果量が
+    ``acc`` で 0.005〜0.012 の実験なので、ここは黙って通さない。
+
+    ``sweep.py`` は ``CUDA_VISIBLE_DEVICES`` を1枚だけ渡すので、この検査は
+    素通りする。手で1本走らせるときだけ引っかかる。
+    """
+    import torch
+
+    count = torch.cuda.device_count()
+    if count == 1:
+        return
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if count == 0:
+        raise SystemExit(
+            'GPU が見えない。--gpus を渡しているか、ドライバが torch の'
+            'ホイールに足りているかを見ること'
+            '（experiments/25_model_seeds/preflight.py）')
+    raise SystemExit(
+        f'GPU が {count} 枚見えている（CUDA_VISIBLE_DEVICES='
+        f'{visible if visible else "未設定"}）。1ジョブは1枚に閉じること — '
+        "2枚以上あると device_map='auto' が7Bを分割し、この実行が測る値だけが"
+        '別のデバイス構成のものになる。`CUDA_VISIBLE_DEVICES=0` を付けるか、'
+        'sweep.py 越しに回すこと')
 
 
 def run_cli(argv):
@@ -474,6 +506,7 @@ def main(argv=None):
     # 探索やベンチを走らせきってから traceback で終わる
     root = Path(args.out).resolve() if args.out else default_root
     root.mkdir(parents=True, exist_ok=True)
+    require_single_gpu()
     plan = build_plan(args, root)
 
     log(f'{args.model}（{MODELS[args.model]}）/ seed {args.seed} / '
