@@ -6,10 +6,10 @@
 # シェルを開き直すたびに source し直すこと。28時間の実行中に再接続したら、
 # もう一度これを読んでから docker logs を見にいく。
 #
-# **共有マシンを汚さない作りにしてある。** ホームには何も書かず、書くのは
-# $CMOE_CACHE と $CMOE_RESULTS の2つだけ。どちらも既定はリポジトリの中で、
-# 環境変数で別の場所（scratch など）へ移せる。ファイルは呼んだ人の uid で
-# 作られるので、root 所有の消せないゴミが残らない。
+# **共有マシンを汚さない作りにしてある。** 書き込むのは /data/kinoshita の下
+# （$CMOE_CACHE と $CMOE_RESULTS）だけで、共有のホームにもリポジトリにも
+# 何も書かない。ファイルは呼んだ人の uid で作られるので、root 所有の消せない
+# ゴミも残らない。片付けは /data/kinoshita を消すだけでよい。
 #
 # 手順の全体は docs/05_running-the-sweep.md にある。
 
@@ -19,11 +19,15 @@ CMOE_REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 CMOE_IMAGE=${CMOE_IMAGE:-kinoshita/cmoe-improve}
 CMOE_NAME=${CMOE_NAME:-kinoshita_cmoe-improve}
 
-# 書き込む先は2つだけ。**ホームは触らない。** モデル28GB とデータセットは
-# $CMOE_CACHE に入るので、共有ホームの容量を食わない。ディスクを分けたいなら
-# source する前に CMOE_CACHE=/scratch/$USER/cmoe-cache のように設定する
-CMOE_CACHE=${CMOE_CACHE:-$CMOE_REPO/.cache}
-CMOE_RESULTS=${CMOE_RESULTS:-$CMOE_REPO/result_logs}
+# 書き込む先は2つだけで、どちらも /data/kinoshita の下に固定してある。
+# **ホームにもリポジトリにも書かない** — アカウントを共有しているので、
+# 28GB のモデルや一次データを共有ホームや共有のリポジトリに置かない。
+# 片付けたいときは、この2つを消せば全部消える。
+#
+# 別の場所にしたいときだけ、source する前に環境変数で上書きする
+CMOE_DATA=${CMOE_DATA:-/data/kinoshita}
+CMOE_CACHE=${CMOE_CACHE:-$CMOE_DATA/cmoe-cache}
+CMOE_RESULTS=${CMOE_RESULTS:-$CMOE_DATA/cmoe-results}
 
 # 置き場所を1つ確かめる。**作れない／書けないなら、その場で理由を言う。**
 # 黙って先へ進むと、docker がホスト側に空のディレクトリを root 所有で作り、
@@ -35,9 +39,10 @@ _cmoe_check_dir() {
     if [ ! -d "$_path" ]; then
         if ! mkdir -p "$_path" 2>/dev/null; then
             echo "  [NG] $_label $_path を作れない" >&2
-            echo "       親ディレクトリに書き込み権が無い。書ける場所を指すこと:" >&2
-            echo "         ${_label}=/scratch/\$USER/cmoe-$_hint" >&2
-            echo "         source scripts/docker-env.sh" >&2
+            echo "       親ディレクトリ $(dirname "$_path") が無いか書けない。" >&2
+            echo "       用意するか、別の場所を指すこと:" >&2
+            echo "         mkdir -p $(dirname "$_path")" >&2
+            echo "         CMOE_DATA=<書ける場所> source scripts/docker-env.sh" >&2
             return 1
         fi
     fi
@@ -47,9 +52,9 @@ _cmoe_check_dir() {
             echo "       root で走らせた実行が作ったものらしい。取り戻すか:" >&2
             echo "         sudo chown -R \$(id -u):\$(id -g) $_path" >&2
             echo "       別の場所を指す:" >&2
-            echo "         ${_label}=/scratch/\$USER/cmoe-$_hint" >&2
+            echo "         CMOE_DATA=<書ける場所> source scripts/docker-env.sh" >&2
         else
-            echo "       書ける場所を ${_label} で指すこと" >&2
+            echo "       CMOE_DATA=<書ける場所> で別の場所を指すこと" >&2
         fi
         return 1
     fi
@@ -118,6 +123,7 @@ cmoe_sweep() {
 
 cmoe_env() {
     echo "REPO    $CMOE_REPO"
+    echo "DATA    $CMOE_DATA      （書き込むのはこの下だけ）"
     echo "IMAGE   $CMOE_IMAGE"
     echo "NAME    $CMOE_NAME"
     echo "CACHE   $CMOE_CACHE $(_cmoe_state "$CMOE_CACHE")"

@@ -32,8 +32,8 @@ Mistral は Llama より1割ほど遅い。**合計およそ110時間、4枚に�
   「HuggingFace の認証」を通しておく。通っていないと preflight のモデルと
   データセットが両方落ちる — 校正が Llama のトークナイザを引くので、**原因は
   1つでも2件に見える**
-- ディスク 100GB ほど（モデル28GB + データセット + 一次データ）。**共有ホームでは
-  なく `$CMOE_CACHE` / `$CMOE_RESULTS` に置く**ので、scratch に逃がせる（手順2）
+- `/data/kinoshita` に 100GB ほどの空き（モデル28GB + データセット + 一次データ）。
+  **共有ホームとリポジトリには何も書かない**
 
 ## 手順1 イメージを作る
 
@@ -84,7 +84,7 @@ export HF_TOKEN=hf_...        # ディスクに残らない。シェルごとに
 かえって認証が通らなくなる。
 
 ファイルに残したいなら `cmoe_login`（ホストには何も入れなくてよい。CLI は
-コンテナの venv にある）。ただし**トークンは `$CMOE_CACHE/huggingface/token` に
+コンテナの venv にある）。ただし**トークンは `/data/kinoshita/cmoe-cache/huggingface/token` に
 平文で残り、そのディレクトリを読める人には見える**ので、アカウントを共有して
 いるなら避けたほうがよい。
 
@@ -93,20 +93,16 @@ export HF_TOKEN=hf_...        # ディスクに残らない。シェルごとに
 
 ### 共有マシンを汚さない作りにしてある
 
-書き込む先は2つだけで、**ホームには何も書かない**。
+書き込むのは **`/data/kinoshita` の下だけ**で、共有のホームにもリポジトリにも
+何も書かない。
 
-| ホスト（変数で移せる） | コンテナ | 何が入るか |
+| ホスト | コンテナ | 何が入るか |
 |---|---|---|
-| `$CMOE_CACHE`（既定 `<repo>/.cache`） | `/workspace/.cache` | モデル28GB、データセット、uv と triton のキャッシュ。**ここだけ育つ** |
-| `$CMOE_RESULTS`（既定 `<repo>/result_logs`） | `/workspace/result_logs` | 一次データ |
+| `/data/kinoshita/cmoe-cache` | `/workspace/.cache` | モデル28GB、データセット、uv と triton のキャッシュ。**ここだけ育つ** |
+| `/data/kinoshita/cmoe-results` | `/workspace/result_logs` | 一次データ |
 
-ディスクを分けたいなら `source` する前に設定する。
-
-```
-CMOE_CACHE=/scratch/$USER/cmoe-cache
-CMOE_RESULTS=/scratch/$USER/cmoe-results
-source scripts/docker-env.sh
-```
+`/data/kinoshita` が無ければ先に作る。別のディスクにしたいときだけ
+`CMOE_DATA=<場所> source scripts/docker-env.sh` で移せる。
 
 **HuggingFace のキャッシュもここに入る**（`HF_HOME=/workspace/.cache/huggingface`）。
 共有ホームの `~/.cache/huggingface` は触らないので、他の人が入れた新しい
@@ -118,7 +114,7 @@ source scripts/docker-env.sh
 壊れたら `CMOE_USER="" source scripts/docker-env.sh` で root に戻せるが、その
 ときは出力の所有者に注意すること。
 
-片付けは `$CMOE_CACHE` と `$CMOE_RESULTS` を消すだけでよい。イメージは
+片付けは `/data/kinoshita` を消すだけでよい。イメージは
 `docker rmi kinoshita/cmoe-improve`。
 
 コンテナ名は3本とも `kinoshita_cmoe-improve` で共通なので、**同時に2本走らせない**
