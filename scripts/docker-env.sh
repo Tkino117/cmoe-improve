@@ -24,7 +24,45 @@ CMOE_NAME=${CMOE_NAME:-kinoshita_cmoe-improve}
 # source する前に CMOE_CACHE=/scratch/$USER/cmoe-cache のように設定する
 CMOE_CACHE=${CMOE_CACHE:-$CMOE_REPO/.cache}
 CMOE_RESULTS=${CMOE_RESULTS:-$CMOE_REPO/result_logs}
-mkdir -p "$CMOE_CACHE" "$CMOE_RESULTS"
+
+# 置き場所を1つ確かめる。**作れない／書けないなら、その場で理由を言う。**
+# 黙って先へ進むと、docker がホスト側に空のディレクトリを root 所有で作り、
+# 共有マシンでは他の人が消せないゴミになる
+_cmoe_check_dir() {
+    _label=$1
+    _path=$2
+    _hint=$3
+    if [ ! -d "$_path" ]; then
+        if ! mkdir -p "$_path" 2>/dev/null; then
+            echo "  [NG] $_label $_path を作れない" >&2
+            echo "       親ディレクトリに書き込み権が無い。書ける場所を指すこと:" >&2
+            echo "         ${_label}=/scratch/\$USER/cmoe-$_hint" >&2
+            echo "         source scripts/docker-env.sh" >&2
+            return 1
+        fi
+    fi
+    if [ ! -w "$_path" ]; then
+        echo "  [NG] $_label $_path に書けない（所有者 $(stat -c '%U:%G' "$_path" 2>/dev/null)）" >&2
+        if [ "$(stat -c '%U' "$_path" 2>/dev/null)" = root ]; then
+            echo "       root で走らせた実行が作ったものらしい。取り戻すか:" >&2
+            echo "         sudo chown -R \$(id -u):\$(id -g) $_path" >&2
+            echo "       別の場所を指す:" >&2
+            echo "         ${_label}=/scratch/\$USER/cmoe-$_hint" >&2
+        else
+            echo "       書ける場所を ${_label} で指すこと" >&2
+        fi
+        return 1
+    fi
+    return 0
+}
+
+CMOE_READY=1
+_cmoe_check_dir CMOE_CACHE "$CMOE_CACHE" cache || CMOE_READY=0
+_cmoe_check_dir CMOE_RESULTS "$CMOE_RESULTS" results || CMOE_READY=0
+if [ "$CMOE_READY" = 0 ]; then
+    echo "  置き場所が用意できていない。cmoe_env で確認すること" >&2
+fi
+unset _label _path _hint
 
 CMOE_MOUNTS="-v $CMOE_CACHE:/workspace/.cache"
 CMOE_MOUNTS="$CMOE_MOUNTS -v $CMOE_RESULTS:/workspace/result_logs"
@@ -82,10 +120,25 @@ cmoe_env() {
     echo "REPO    $CMOE_REPO"
     echo "IMAGE   $CMOE_IMAGE"
     echo "NAME    $CMOE_NAME"
-    echo "CACHE   $CMOE_CACHE      （モデル28GB とデータセット。ここだけ育つ）"
-    echo "RESULTS $CMOE_RESULTS"
+    echo "CACHE   $CMOE_CACHE $(_cmoe_state "$CMOE_CACHE")"
+    echo "        （モデル28GB とデータセット。ここだけ育つ）"
+    echo "RESULTS $CMOE_RESULTS $(_cmoe_state "$CMOE_RESULTS")"
     echo "USER    ${CMOE_USER:-（未指定 = root で走る。出力が root 所有になる）}"
     echo "AUTH    ${CMOE_AUTH:-（HF_TOKEN 未設定。$CMOE_CACHE/huggingface/token を使う）}"
     echo
-    echo "ホームには何も書かない。消したいときは上の CACHE と RESULTS だけ消す"
+    if [ "${CMOE_READY:-1}" = 0 ]; then
+        echo "**置き場所が用意できていない。** 上の [NG] を直してから source し直す"
+    else
+        echo "ホームには何も書かない。消したいときは上の CACHE と RESULTS だけ消す"
+    fi
+}
+
+_cmoe_state() {
+    if [ ! -d "$1" ]; then
+        echo "[NG 無い]"
+    elif [ ! -w "$1" ]; then
+        echo "[NG 書けない / 所有者 $(stat -c '%U:%G' "$1" 2>/dev/null)]"
+    else
+        echo "[OK $(stat -c '%U:%G' "$1" 2>/dev/null)]"
+    fi
 }
