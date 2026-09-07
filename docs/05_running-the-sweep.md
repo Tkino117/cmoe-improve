@@ -28,7 +28,12 @@ Mistral は Llama より1割ほど遅い。**合計およそ110時間、4枚に�
   minor version compatibility に頼っている。測定先の 535.309.01（CUDA 12.2）は
   満たしている。版そのものは `nvidia-smi` で見る。実際に動くかは手順2 で確かめる
 - Docker と NVIDIA Container Toolkit（`docker run --gpus` が通ること）
-- HuggingFace のモデルを引けること（Llama-2 は利用規約の同意が要る）
+- HuggingFace のモデルを引けること。**Llama-2 は gated なので、ホスト側で
+  `huggingface-cli login` を1回通しておく**（`~/.cache/huggingface/token` に
+  書かれ、マウント経由でコンテナに入る）。`HF_TOKEN` を環境変数で持っている
+  なら `source scripts/docker-env.sh` がそれを拾って渡す。通っていないと
+  preflight のモデルとデータセットが両方落ちる（校正が Llama のトークナイザを
+  引くので、原因は1つでも2件に見える）
 - ディスク 100GB ほど（モデル28GB + データセット + 一次データ）
 
 ## 手順1 イメージを作る
