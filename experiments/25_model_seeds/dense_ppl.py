@@ -57,6 +57,15 @@ def main(argv=None):
     payload_path = out_dir / 'dense_ppl.json'
     if payload_path.exists():
         record = json.loads(payload_path.read_text())
+        given = record.get('arguments', {})
+        # データセット名だけでは足りない。--seqlen が違えば別の測定である
+        # （既定の出力先はモデルごとに分かれるが、seqlen は素通りしてしまう）
+        differences = [key for key in ('model', 'seqlen')
+                       if given.get(key) != getattr(args, key)]
+        if differences:
+            raise SystemExit(
+                f'{payload_path} は違う条件で測ったものである'
+                f'（{", ".join(differences)}）。別の --out を指定すること')
         if sorted(record.get('results', {})) == sorted(datasets):
             log(f'{payload_path} は測り済み')
             for name, row in record['results'].items():

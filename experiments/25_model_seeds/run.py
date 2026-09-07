@@ -117,11 +117,24 @@ def same_experiment(record, argv):
 
     ``model`` はここに含まれる。**出力先の名前にモデルの札を入れないと**、
     別モデルの実行が既存のディレクトリに当たって毎回ここで止まる。
+
+    **記録に無いキーは差分に数えない。** CLI に引数が1つ足されると、それ以前に
+    測った記録にはそのキーが無く、``given.get(key)`` が ``None`` を返す。既定値が
+    ``None`` でなければ（``0`` や ``'all'``）必ず差分になり、中身は同じ実験なのに
+    「違う実験の出力である。そのディレクトリを退けること」と案内されて、
+    数時間ぶんの正しい結果を捨てることになる。実際 report/06・07 の記録は
+    ``lookahead`` / ``profile_positions`` を持たないので、この除外が無いと
+    seed 0..2 の段1 が即死する。足された引数は既定値で走ったものとみなし、
+    数えた代わりに ``old_arguments`` として呼ぶ側へ返す。
     """
     wanted = vars(build_parser().parse_args(argv))
     given = record.get('arguments', {})
-    return [key for key in sorted(wanted)
-            if key not in NOT_IDENTITY and given.get(key) != wanted[key]]
+    differences = [key for key in sorted(wanted)
+                   if key not in NOT_IDENTITY and key in given
+                   and given[key] != wanted[key]]
+    missing = sorted(key for key in wanted
+                     if key not in NOT_IDENTITY and key not in given)
+    return differences, missing
 
 
 def ensure(out_dir, result_name, argv, is_finished):
@@ -137,7 +150,7 @@ def ensure(out_dir, result_name, argv, is_finished):
     else:
         if out_dir.exists():
             if record is not None:
-                differences = same_experiment(record, argv)
+                differences, _ = same_experiment(record, argv)
                 if differences:
                     raise SystemExit(
                         f'{out_dir} は違う実験の出力である'
@@ -148,10 +161,15 @@ def ensure(out_dir, result_name, argv, is_finished):
         record = load(payload) if payload.exists() else None
         if record is None or not is_finished(record):
             raise SystemExit(f'{out_dir} に終わった段が残らなかった')
-    differences = same_experiment(record, argv)
+    differences, missing = same_experiment(record, argv)
     if differences:
         raise SystemExit(
             f'{out_dir} は違う実験の出力である（{", ".join(differences)}）')
+    if missing:
+        # 記録が古い引数集合で測られている。既定値で走ったものとみなして通すが、
+        # 何を仮定したかは残す
+        log(f'  {out_dir.name}: 記録に無い引数 {", ".join(missing)} '
+            f'— 既定値で測られたものとみなす')
     return record
 
 
@@ -309,6 +327,14 @@ def bench_stage(root, plan, seed, searched, kind='bench'):
     if plan['layers']:
         argv += ['--layers', str(plan['layers'])]
     reference = plan['reference'][kind]
+    if reference is not None and out_dir in reference.parents:
+        # 自分が書き先にしているディレクトリを基準として読もうとしている
+        # （llama2-7b / A=6 / seed 0 の MMLU 段がこれに当たる）。済みで抜ける
+        # 限り無害だが、``retire()`` が走ると dense ごと退避されて、直後の
+        # ``cmoe run`` が --bench-reference の欠損で落ちる
+        log(f'  dense の置き場所が出力先と同じ（{out_dir.name}）。'
+            '取り込みではなくこの実行が持っているものを使う')
+        reference = None
     if reference is not None:
         if not reference.exists():
             raise SystemExit(
@@ -423,7 +449,9 @@ def main(argv=None):
         default_root = default_root / 'exp25_smoke'
     elif args.check:
         default_root = default_root / 'exp25_check'
-    root = Path(args.out) if args.out else default_root
+    # 絶対にしておく。相対のままだと ``relative_to(ROOT)`` が段の**後**で落ち、
+    # 探索やベンチを走らせきってから traceback で終わる
+    root = Path(args.out).resolve() if args.out else default_root
     root.mkdir(parents=True, exist_ok=True)
     plan = build_plan(args, root)
 

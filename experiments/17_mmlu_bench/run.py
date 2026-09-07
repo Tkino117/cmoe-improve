@@ -124,11 +124,21 @@ def retire(path):
 
 
 def same_experiment(record, argv):
-    """記録された引数が、いま走らせようとしている実験と同じものか。"""
+    """記録された引数が、いま走らせようとしている実験と同じものか。
+
+    **記録に無いキーは差分に数えない。** CLI に引数が1つ足されると、それ以前に
+    測った記録にはそのキーが無く、既定値が ``None`` でなければ必ず差分になる。
+    中身は同じ実験なのに「そのディレクトリを退けること」と案内され、測り直しに
+    なってしまう。足された引数は既定値で走ったものとみなす。
+    """
     wanted = vars(build_parser().parse_args(argv))
     given = record.get('arguments', {})
-    return [key for key in sorted(wanted)
-            if key not in NOT_IDENTITY and given.get(key) != wanted[key]]
+    differences = [key for key in sorted(wanted)
+                   if key not in NOT_IDENTITY and key in given
+                   and given[key] != wanted[key]]
+    missing = sorted(key for key in wanted
+                     if key not in NOT_IDENTITY and key not in given)
+    return differences, missing
 
 
 def ensure(out_dir, result_name, argv, is_finished):
@@ -140,7 +150,7 @@ def ensure(out_dir, result_name, argv, is_finished):
     else:
         if out_dir.exists():
             if record is not None:
-                differences = same_experiment(record, argv)
+                differences, _ = same_experiment(record, argv)
                 if differences:
                     raise SystemExit(
                         f'{out_dir} は違う実験の出力である'
@@ -151,10 +161,13 @@ def ensure(out_dir, result_name, argv, is_finished):
         record = load(payload) if payload.exists() else None
         if record is None or not is_finished(record):
             raise SystemExit(f'{out_dir} に終わった段が残らなかった')
-    differences = same_experiment(record, argv)
+    differences, missing = same_experiment(record, argv)
     if differences:
         raise SystemExit(
             f'{out_dir} は違う実験の出力である（{", ".join(differences)}）')
+    if missing:
+        log(f'  {out_dir.name}: 記録に無い引数 {", ".join(missing)} '
+            f'— 既定値で測られたものとみなす')
     return record
 
 
@@ -174,7 +187,14 @@ def target_dir(root, source_set, nactive, seed):
 
 
 def dense_reference(root):
-    """dense は1つだけ。``main`` の A=6 / seed 0 の中に置いてある。"""
+    """dense は1つだけ。``main`` の A=6 / seed 0 の中に置いてある。
+
+    ``main`` 以外の ``--set`` はここへ何も書かないので、``main`` が未実行だと
+    毎ジョブ自前で測ることになる（MMLU の dense は14,042問で1時間強かかるので、
+    6ジョブで5時間の無駄になるうえ、表ごとに別の dense を基準に持ってしまい
+    ``ref_kl`` / ``ref_agreement`` が main の表と揃わない）。呼ぶ側が
+    ``require`` で止める。
+    """
     return target_dir(root, 'main', *DENSE_AT) / 'bench' / 'dense.json'
 
 
@@ -187,6 +207,7 @@ def source_allocations(root, source_set, nactive, seed):
     先に出たほうを残して畳む。
     """
     specs = []
+    head = None
     for directory in source_dirs(root, source_set, nactive, seed):
         payload = directory / 'summary.json'
         if not payload.exists():
@@ -199,7 +220,17 @@ def source_allocations(root, source_set, nactive, seed):
         if record['arguments']['nactive'] != nactive:
             raise SystemExit(
                 f'{payload} は A={record["arguments"]["nactive"]} の実行である')
-        specs.extend(record['arguments']['alloc'])
+        allocations = record['arguments']['alloc']
+        # 元が2つ以上あるとき、先頭（＝対応のある比較の基準）が食い違っていたら
+        # 束ねてはいけない。2つ目の元の行が、自分の基準ではなく1つ目の基準と
+        # 対にされてしまう
+        if head is None:
+            head = allocations[0]
+        elif allocations[0] != head:
+            raise SystemExit(
+                f'{payload} の基準は {allocations[0]} で、束ねる先の {head} と'
+                '違う。同じ基準を持つ元どうしでないと1つの表にできない')
+        specs.extend(allocations)
     return list(dict.fromkeys(specs))
 
 
@@ -312,6 +343,15 @@ def main(argv=None):
             allocations = source_allocations(ROOT / 'result_logs',
                                              args.source_set, nactive, seed)
         reference = dense_reference(root)
+        if (args.source_set != 'main' and not args.smoke
+                and not reference.exists()):
+            # main 以外は dense を書かない。ここで止めないと、6ジョブが
+            # それぞれ自前で dense（14,042問）を測り、しかも表ごとに違う基準を
+            # 持つことになる
+            raise SystemExit(
+                f'{reference} が無い。--set {args.source_set} は dense を'
+                f'自分で測らないので、先に --set main --nactive {DENSE_AT[0]} '
+                f'--seed {DENSE_AT[1]} を通すこと')
         plan = {
             'layers': 2 if args.smoke else None,
             # slimpajama は7成分に最低1本ずつ配る。smoke でもそれ未満には落とせない
