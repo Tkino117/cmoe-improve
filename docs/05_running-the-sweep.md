@@ -28,11 +28,12 @@ Mistral は Llama より1割ほど遅い。**合計およそ110時間、4枚に�
   minor version compatibility に頼っている。測定先の 535.309.01（CUDA 12.2）は
   満たしている。版そのものは `nvidia-smi` で見る。実際に動くかは手順2 で確かめる
 - Docker と NVIDIA Container Toolkit（`docker run --gpus` が通ること）
-- HuggingFace のモデルを引けること。**Llama-2 は gated** なので、手順2 のあとに
-  `cmoe_login` を1回通す（下記）。通っていないと preflight のモデルと
+- HuggingFace のモデルを引けること。**Llama-2 は gated** なので、手順2 の
+  「HuggingFace の認証」を通しておく。通っていないと preflight のモデルと
   データセットが両方落ちる — 校正が Llama のトークナイザを引くので、**原因は
   1つでも2件に見える**
-- ディスク 100GB ほど（モデル28GB + データセット + 一次データ）
+- ディスク 100GB ほど（モデル28GB + データセット + 一次データ）。**共有ホームでは
+  なく `$CMOE_CACHE` / `$CMOE_RESULTS` に置く**ので、scratch に逃がせる（手順2）
 
 ## 手順1 イメージを作る
 
@@ -67,37 +68,58 @@ cmoe_env                       # 設定を確認する
 |---|---|
 | `cmoe1 <コマンド>` | **GPU 1枚だけ見せる。** 手順3 の smoke、手順4、手順5 はこれ |
 | `cmoeall <コマンド>` | 全部見せる。**preflight だけ**（枚数を数えるのが仕事なので絞らない） |
-| `cmoe_login` | HuggingFace にログインする（最初に1回） |
+| `cmoe_login` | HuggingFace にログインする（`HF_TOKEN` を使うなら不要） |
 | `cmoe_sweep` | 手順6 の常駐コンテナを起こす |
 
-### HuggingFace のログイン（最初に1回）
+### HuggingFace の認証
+
+Llama-2 は gated なので通しておく。**共有アカウントなら環境変数を勧める。**
 
 ```
-cmoe_login
+export HF_TOKEN=hf_...        # ディスクに残らない。シェルごとに設定する
 ```
 
-**ホストには何も入れなくてよい。** CLI はコンテナの venv にあり、
-`~/.cache/huggingface` を read-write でマウントしているので、**中で書いた
-トークンはホスト側のファイルに残る**（コンテナを捨てても消えない）。次回以降は
-不要。
+`source` がこれを拾ってコンテナへ渡す（`cmoe_env` の `AUTH` 行で確認できる）。
+**設定されているときだけ渡す** — 空のまま渡すとファイル側のトークンを上書きして、
+かえって認証が通らなくなる。
 
-`HF_TOKEN` を環境変数で持っているなら、`source` がそれを拾って渡すのでログインは
-いらない。**設定されているときだけ渡す** — 空のまま渡すとファイル側のトークンを
-上書きして、かえって認証が通らなくなる。いまどちらを使うかは `cmoe_env` の
-`AUTH` 行で分かる。
+ファイルに残したいなら `cmoe_login`（ホストには何も入れなくてよい。CLI は
+コンテナの venv にある）。ただし**トークンは `$CMOE_CACHE/huggingface/token` に
+平文で残り、そのディレクトリを読める人には見える**ので、アカウントを共有して
+いるなら避けたほうがよい。
 
 **シェルを開き直すたびに `source` し直すこと。** 28時間の実行中に再接続したら、
 もう一度読んでから `docker logs` を見にいく。
 
-マウントはリポジトリ直下から**絶対パスで**組み立てる（スクリプト自身の位置から
-決めるので、どのディレクトリで `source` しても同じ場所を向く）。相対パスだと
-`.cache` と `result_logs` が黙って別の場所を向く。
+### 共有マシンを汚さない作りにしてある
 
-| ホスト | コンテナ | 何のため |
+書き込む先は2つだけで、**ホームには何も書かない**。
+
+| ホスト（変数で移せる） | コンテナ | 何が入るか |
 |---|---|---|
-| `~/.cache/huggingface` | `/root/.cache/huggingface` | モデル28GB とデータセット。読むだけなので4ジョブで共有してよい |
-| `<repo>/.cache` | `/workspace/.cache` | **ベンチ専用の隔離した datasets キャッシュ。** 既定の HuggingFace キャッシュに新しい `datasets` が書いた索引が混じっていると、固定してある 2.21.0 が知らない特徴量の型で落ちる |
-| `<repo>/result_logs` | `/workspace/result_logs` | 一次データ。ジョブごとにディレクトリが分かれるので4本で共有してよい |
+| `$CMOE_CACHE`（既定 `<repo>/.cache`） | `/workspace/.cache` | モデル28GB、データセット、uv と triton のキャッシュ。**ここだけ育つ** |
+| `$CMOE_RESULTS`（既定 `<repo>/result_logs`） | `/workspace/result_logs` | 一次データ |
+
+ディスクを分けたいなら `source` する前に設定する。
+
+```
+CMOE_CACHE=/scratch/$USER/cmoe-cache
+CMOE_RESULTS=/scratch/$USER/cmoe-results
+source scripts/docker-env.sh
+```
+
+**HuggingFace のキャッシュもここに入る**（`HF_HOME=/workspace/.cache/huggingface`）。
+共有ホームの `~/.cache/huggingface` は触らないので、他の人が入れた新しい
+`datasets` の索引と混ざる心配もない（固定してある 2.21.0 が知らない特徴量の型で
+落ちる、という既知の問題を避けられる）。
+
+**コンテナは呼んだ人の uid で走る**（`--user $(id -u):$(id -g)`）。既定の root で
+走らせると、マウント先に root 所有のファイルが残って他の人が消せない。何か
+壊れたら `CMOE_USER="" source scripts/docker-env.sh` で root に戻せるが、その
+ときは出力の所有者に注意すること。
+
+片付けは `$CMOE_CACHE` と `$CMOE_RESULTS` を消すだけでよい。イメージは
+`docker rmi kinoshita/cmoe-improve`。
 
 コンテナ名は3本とも `kinoshita_cmoe-improve` で共通なので、**同時に2本走らせない**
 こと（名前が衝突する）。手順3〜5 は上から順に1本ずつなので問題にならない。

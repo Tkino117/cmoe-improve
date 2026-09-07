@@ -41,17 +41,29 @@ RUN mkdir -p src/cmoe && touch src/cmoe/__init__.py \
 COPY . .
 RUN uv sync --frozen
 
-# 実行時に uv が解決し直さない。4本が同時に venv を触るのを避ける
+# 実行時に uv が解決し直さない。4本が同時に venv を触るのを避ける。
+#
+# **書き込む先を /workspace/.cache に集める。** /root 以下に散らすと、
+# --user で非 root として走らせたときに書けない。共有マシンでは root 所有の
+# ファイルを残さないほうが大事なので、そちらに寄せてある
 ENV UV_FROZEN=1 \
     UV_NO_SYNC=1 \
     TOKENIZERS_PARALLELISM=false \
-    HF_HOME=/root/.cache/huggingface \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HOME=/workspace/.cache/huggingface \
+    XDG_CACHE_HOME=/workspace/.cache \
+    UV_CACHE_DIR=/workspace/.cache/uv \
+    TRITON_CACHE_DIR=/workspace/.cache/triton
 
-# マウントするもの（いずれもホストと共有する）:
-#   /root/.cache/huggingface  モデル14GB とデータセット。読むだけなので4本で共有可
-#   /workspace/.cache         lm-eval のデータセットキャッシュ
-#   /workspace/result_logs    一次データ。ジョブごとにディレクトリが分かれる
-VOLUME ["/root/.cache/huggingface", "/workspace/.cache", "/workspace/result_logs"]
+# 非 root でも venv を読めるようにする（実行するだけで書きはしない）
+RUN chmod -R a+rX /workspace/.venv
+
+# マウントするのは2つだけ。**ホームには何も書かない**:
+#   /workspace/.cache        モデル28GB・データセット・uv/triton のキャッシュ
+#   /workspace/result_logs   一次データ。ジョブごとにディレクトリが分かれる
+#
+# VOLUME は宣言しない。マウントを忘れたときに匿名ボリュームが作られて、
+# それ自体が消し忘れのゴミになる
 
 CMD ["bash"]
