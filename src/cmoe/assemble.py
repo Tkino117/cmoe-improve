@@ -105,7 +105,7 @@ def build_moe(dense, partition, topk, router, n_experts):
 
 
 def layer_factory(carver, n_experts, bias_speed=0.001, router_norm=True,
-                  device=None):
+                  device=None, router_method=None):
     """配分オラクルへ渡す「x → その層に載る MoE」。
 
     配分の探索は、候補 x の層が実際にどう振る舞うかを見なければ採点できないが、
@@ -116,6 +116,17 @@ def layer_factory(carver, n_experts, bias_speed=0.001, router_norm=True,
     層に載せるのと同じ経路（``build_baseline_router`` → ``build_moe``）を通る。
     探索が測った層と、あとで ``Converter`` が載せる層が別物にならないための
     取り決めである。
+
+    ``router_method`` を渡すと、候補の層にその方式のルーターが載る。**配分と
+    ルーターを揃えて探索する**ときに使う。既定の None では基準ルーター（現行
+    CMoE）が載り、これが report/07・08 の探索が通った経路である。配分が方式1
+    の前提で選ばれていることは、あとで別の方式を載せたときの食い違いになる。
+
+    方式が読む ``fit_z`` には**探索が持っている z（校正データの、その層での
+    活性）**を渡す。``Converter`` が使う独立した fit セットは探索の中に無い。
+    Top-K=0 の層では方式を呼ばない — routed のループが一度も回らないので、
+    どの方式も出力を1ビットも変えられない（``Converter._build_routers`` と
+    同じ断り方である）。
     """
     @torch.no_grad()
     def build(dense, rates, markers, n_shared, topk, z=None):
@@ -123,6 +134,11 @@ def layer_factory(carver, n_experts, bias_speed=0.001, router_norm=True,
         router = build_baseline_router(dense, partition, topk,
                                        bias_speed=bias_speed,
                                        normalize=router_norm)
+        if router_method is not None and topk > 0:
+            context = make_context(
+                None, dense, partition, topk, router_method,
+                rates=rates, markers=markers, fit_z=z, normalize=router_norm)
+            router = build_router(router_method, context, router)
         moe = build_moe(dense, partition, topk, router, n_experts)
         # expert とルーターの行は dense の重みから来るので既に層と同じデバイスに
         # ある。ゼロで作った extra_scale / extra_bias だけが取り残される

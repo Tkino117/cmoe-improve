@@ -229,6 +229,12 @@ def add_oracle_arguments(parser, layers_help):
     parser.add_argument('--oracle', default='suffix_kl',
                         help='採点オラクル。安い順に mass / local_error / suffix_kl')
     parser.add_argument('--carver', default='cmoe', help='分割方式')
+    parser.add_argument(
+        '--router', default=None,
+        help='候補の層に載せるルーター方式。省略時は基準ルーター（現行 CMoE）'
+             'で、これが report/07・08 の探索が通った経路である。渡すと配分と'
+             'ルーターを揃えて探索できる。rank は名前に添える'
+             '（例 spectral_mass:128）— 探索には --spectral-rank が無い')
     parser.add_argument('--calib', default='wikitext2', help='キャリブレーションセット')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--nsamples', type=int, default=8,
@@ -795,11 +801,16 @@ def build_walk(args, adapter, calibration):
     profile_mask = scored_mask(args, calibration)
     weights = score_weights(args, calibration)
     choices = choice_scoring(args, calibration)
+    # 方式は名前だけから作る。CLI の既定で rank を上書きしないのは、探索の
+    # 引数に方式ごとのつまみを増やさないためで、変種は名前に添えて指定する
+    method = create_method(args.router) if args.router else None
+    if method is not None:
+        log(f'  候補の層に載せるルーター: {method.name}')
     factory = layer_factory(
         create_carver(args.carver, args.nexperts, k_act=args.k_act),
         args.nexperts,
         bias_speed=args.bias_speed, router_norm=not args.no_router_norm,
-        device=adapter.device)
+        device=adapter.device, router_method=method)
     return LayerWalk(
         adapter, inputs, factory, args.nexperts,
         n_active_total=args.nactive, k_act=args.k_act,

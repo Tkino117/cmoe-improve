@@ -16,19 +16,34 @@ MMLU（test 14,042問）は今回ベンチに足したばかりで、slimpajama 
   25%  bench_slimpajama_seed<N>     10構成 → bench_mmlu_slimpajama_seed<N>
   50%  bench_slimpajama_a4_seed<N>   8構成 → bench_mmlu_slimpajama_a4_seed<N>
 
+**元の実行は ``--set`` で選ぶ。** 既定の ``main`` は上の一様＋探索の表である。
+``baselines`` は [report/21](../../report/21_ew-rule-baseline.md) の EW-rule と
+[report/22](../../report/22_alloc-baselines.md) の対照5行で、こちらは5タスクと
+PPL だけ測ってあって MMLU が無い。res16 / res22 の MMLU 列の「—」がこれで埋まる。
+
+  baselines 25%  bench22_seed<N> + ew_bench_seed<N>       → bench_mmlu_baselines_seed<N>
+  baselines 50%  bench22_a4_seed<N> + ew_bench_a4_seed<N> → bench_mmlu_baselines_a4_seed<N>
+
+対照の一様（A=6 なら uniform3、A=4 なら uniform2）は両方の元に入っているので、
+束ねるときに1本に畳む。**先頭に来るのはこの一様で、対応のある比較の基準になる。**
+main 側で同じ配分の MMLU を既に測ってあり、突き合わせれば run をまたいで
+同じ表に並べてよいことをその場で確かめられる（report/21 と同じ再現の検査）。
+
 **75%（A=2）は測らない。** 実験16 で5タスクの acc が chance（macro 0.35）に
 張り付くところまで壊れていることが分かった。MMLU の chance は 0.25 なので、
 測っても床を確かめるだけになる。必要になったら ``--nactive 2`` で回せる。
 
 dense の基準は既存のものを使えない（`bench_h4` の dense は5タスクぶんしか無く、
 ``cmoe run`` はタスクの顔ぶれが違えば取り込みを断る）。**最初の1回だけ測り**、
-残りは全部それを取り込む。置き場所は A=6 / seed 0 の実行の中である。
+残りは全部それを取り込む。置き場所は ``main`` の A=6 / seed 0 の実行の中で、
+``baselines`` も同じものを取り込む（dense は配分にも校正にも依らない）。
 
   uv run python experiments/17_mmlu_bench/run.py --smoke            # 2層・科目あたり2問
   uv run python experiments/17_mmlu_bench/run.py --nactive 6 --seed 0  # dense も測る
   uv run python experiments/17_mmlu_bench/run.py --nactive 6 --seed 1
   ...
   uv run python experiments/17_mmlu_bench/run.py --all              # 25% と 50% × 3 seed
+  uv run python experiments/17_mmlu_bench/run.py --set baselines --all   # 対照の穴埋め
 
 まとめは 06・07・16 の ``summarize_seeds.py`` とは別で、report を書くときに
 ``cmoe.eval.bench.load_samples()`` で5タスクぶんと束ねる。
@@ -64,6 +79,19 @@ SEEDS = (0, 1, 2)
 # dense を測る1回。ここ以外は全部これを取り込む（dense は変換していないモデル
 # なので、A にも校正にも seed にも配分にも依らない）
 DENSE_AT = (6, 0)
+
+# 元の実行の置き場所。``{tag}`` は A=6 で空、それ以外は ``_a<A>``。
+# 束ねる順がそのまま ``--alloc`` の順になり、**先頭が対応のある比較の基準**に
+# なるので、対照の一様を先頭に持つ側を先に並べる
+SOURCE_SETS = {
+    'main': ('bench_{calib}{tag}_seed{seed}',),
+    'baselines': ('bench22{tag}_seed{seed}', 'ew_bench{tag}_seed{seed}'),
+}
+# 測り先。``main`` は report/17 の頃の名前を保つ
+TARGET_SETS = {
+    'main': 'bench_mmlu_{calib}{tag}_seed{seed}',
+    'baselines': 'bench_mmlu_baselines{tag}_seed{seed}',
+}
 
 # 結果を変えない引数（出力先・チャンク幅・基準の取り込み元）。同じ実験かの判定から外す
 NOT_IDENTITY = {'out', 'batch_chunk', 'token_chunk', 'search_token_chunk',
@@ -135,41 +163,49 @@ def tag(nactive):
     return '' if nactive == 6 else f'_a{nactive}'
 
 
-def source_dir(root, nactive, seed):
-    return root / f'bench_{CALIB}{tag(nactive)}_seed{seed}'
+def source_dirs(root, source_set, nactive, seed):
+    return [root / name.format(calib=CALIB, tag=tag(nactive), seed=seed)
+            for name in SOURCE_SETS[source_set]]
 
 
-def target_dir(root, nactive, seed):
-    return root / f'bench_mmlu_{CALIB}{tag(nactive)}_seed{seed}'
+def target_dir(root, source_set, nactive, seed):
+    return root / TARGET_SETS[source_set].format(
+        calib=CALIB, tag=tag(nactive), seed=seed)
 
 
 def dense_reference(root):
-    return target_dir(root, *DENSE_AT) / 'bench' / 'dense.json'
+    """dense は1つだけ。``main`` の A=6 / seed 0 の中に置いてある。"""
+    return target_dir(root, 'main', *DENSE_AT) / 'bench' / 'dense.json'
 
 
-def source_allocations(root, nactive, seed):
-    """元の実行が測った配分を、順番ごと写す。
+def source_allocations(root, source_set, nactive, seed):
+    """元の実行が測った配分を、順番ごと写して束ねる。
 
-    探索が出した配分は seed ごとに違うので、ここで作り直すと別物になる。
-    先頭は対応のある比較の基準なので、順番まで元のとおりにする。
+    探索や規則が出した配分は seed ごとに違うので、ここで作り直すと別物になる。
+    先頭は対応のある比較の基準なので、順番まで元のとおりにする。元が2つ以上
+    あるときは並べた順につなぎ、重なる配分（どちらにも入っている対照の一様）は
+    先に出たほうを残して畳む。
     """
-    payload = source_dir(root, nactive, seed) / 'summary.json'
-    if not payload.exists():
-        raise SystemExit(
-            f'{payload} が無い。MMLU は既に測った構成に足すものなので、'
-            f'元の実行（A={nactive} / seed {seed}）を先に通すこと')
-    record = load(payload)
-    if 'bench_summary' not in record or record.get('failures'):
-        raise SystemExit(f'{payload} は終わっていない実行である')
-    if record['arguments']['nactive'] != nactive:
-        raise SystemExit(
-            f'{payload} は A={record["arguments"]["nactive"]} の実行である')
-    return list(record['arguments']['alloc'])
+    specs = []
+    for directory in source_dirs(root, source_set, nactive, seed):
+        payload = directory / 'summary.json'
+        if not payload.exists():
+            raise SystemExit(
+                f'{payload} が無い。MMLU は既に測った構成に足すものなので、'
+                f'元の実行（A={nactive} / seed {seed}）を先に通すこと')
+        record = load(payload)
+        if 'bench_summary' not in record or record.get('failures'):
+            raise SystemExit(f'{payload} は終わっていない実行である')
+        if record['arguments']['nactive'] != nactive:
+            raise SystemExit(
+                f'{payload} は A={record["arguments"]["nactive"]} の実行である')
+        specs.extend(record['arguments']['alloc'])
+    return list(dict.fromkeys(specs))
 
 
-def bench_stage(root, nactive, seed, plan):
+def bench_stage(root, source_set, nactive, seed, plan):
     """1つの動作点・1つの seed を MMLU で測る。"""
-    out_dir = target_dir(root, nactive, seed)
+    out_dir = target_dir(root, source_set, nactive, seed)
     specs = plan['allocations']
     argv = ['run']
     for spec in specs:
@@ -238,6 +274,10 @@ def main(argv=None):
     parser.add_argument('--nactive', type=int, default=6, choices=NACTIVES,
                         help='動作点。6=25%% / 4=50%% / 2=75%%')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--set', dest='source_set', default='main',
+                        choices=sorted(SOURCE_SETS),
+                        help='元の実行。main=一様＋探索 / '
+                             'baselines=EW-rule と report/22 の対照5行')
     parser.add_argument('--all', action='store_true',
                         help='25%% と 50%% を 3 seed ずつまとめて回す（75%% は入らない）')
     parser.add_argument('--out', default=None, help='出力の置き場所')
@@ -253,20 +293,24 @@ def main(argv=None):
 
     started = time.time()
     record = {'calib': CALIB, 'tasks': TASKS, 'nexperts': NEXPERTS,
-              'smoke': args.smoke, 'runs': []}
+              'source_set': args.source_set, 'smoke': args.smoke, 'runs': []}
 
     for nactive, seed in jobs(args):
-        log(f'\n=== MMLU / N={NEXPERTS} A={nactive}'
+        log(f'\n=== MMLU / {args.source_set} / N={NEXPERTS} A={nactive}'
             f'（スパース率 {100 * (NEXPERTS - nactive) // NEXPERTS}%）'
             f' / seed {seed} ===')
         if args.smoke:
-            source = source_dir(ROOT / 'result_logs', nactive, seed)
+            sources = source_dirs(ROOT / 'result_logs', args.source_set,
+                                  nactive, seed)
             # smoke は経路の確認なので、元の実行がまだ無い動作点でも通す
-            allocations = (source_allocations(ROOT / 'result_logs', nactive, seed)[:2]
-                           if (source / 'summary.json').exists()
-                           else [f'uniform{nactive // 2}', f'uniform{nactive}'])
+            allocations = (
+                source_allocations(ROOT / 'result_logs', args.source_set,
+                                   nactive, seed)[:2]
+                if all((path / 'summary.json').exists() for path in sources)
+                else [f'uniform{nactive // 2}', f'uniform{nactive}'])
         else:
-            allocations = source_allocations(ROOT / 'result_logs', nactive, seed)
+            allocations = source_allocations(ROOT / 'result_logs',
+                                             args.source_set, nactive, seed)
         reference = dense_reference(root)
         plan = {
             'layers': 2 if args.smoke else None,
@@ -279,13 +323,14 @@ def main(argv=None):
             'reference': reference if reference.exists() else None,
         }
         log(f'  配分 {len(allocations)} 種: '
-            + ', '.join(spec if spec.startswith('uniform') else '探索'
+            + ', '.join(spec if spec.startswith('uniform') else '配分'
                         for spec in allocations))
         done = {'nactive': nactive, 'seed': seed,
-                **bench_stage(root, nactive, seed, plan)}
+                **bench_stage(root, args.source_set, nactive, seed, plan)}
         record['runs'].append(done)
         # 1本ずつ回しても --all で回しても、同じ名前の記録が残るようにする
-        summarize(root / f'exp17_stages_a{nactive}_seed{seed}.json',
+        stem = ('' if args.source_set == 'main' else f'_{args.source_set}')
+        summarize(root / f'exp17_stages{stem}_a{nactive}_seed{seed}.json',
                   {**record, 'runs': [done]})
 
     record['seconds'] = time.time() - started
