@@ -47,39 +47,45 @@ CUDA はイメージに入れていない。torch のホイールが CUDA ラン
 いるので、要るのはホスト側のドライバだけである。依存は build 時に
 `uv sync --frozen` で焼いてあり、実行時は解決し直さない。
 
-## 手順2 コマンドの型を決める
+## 手順2 呼び出し用の関数を読み込む
 
-以降すべて同じマウントで走らせる。**リポジトリ直下で、絶対パスで**定義する
-（`$PWD` を使うと別のディレクトリから呼んだときに `.cache` と `result_logs` が
-黙って別の場所を向く）。
+**ホスト側のシェルで実行する。**
 
 ```
-REPO=/abs/path/to/cmoe-improve
-IMAGE=kinoshita/cmoe-improve
-NAME=kinoshita_cmoe-improve
-MOUNTS="-v $HOME/.cache/huggingface:/root/.cache/huggingface \
-        -v $REPO/.cache:/workspace/.cache \
-        -v $REPO/result_logs:/workspace/result_logs"
-
-# 1枚だけ見せる版。sweep.py 以外はこちらを使う
-alias cmoe1="docker run --rm --name $NAME --gpus all -e CUDA_VISIBLE_DEVICES=0 $MOUNTS $IMAGE"
-# 4枚見せる版。preflight だけ
-alias cmoeall="docker run --rm --name $NAME --gpus all $MOUNTS $IMAGE"
+cd /abs/path/to/cmoe-improve
+source scripts/docker-env.sh
+cmoe_env                       # 設定を確認する
 ```
 
-`--rm` なので名前は終了時に解放される。**この2本は同時に走らせない**こと
-（名前が衝突する）。手順3〜5 は上から順に1本ずつなので問題にならない。
+以降の手順はすべて同じマウントで走らせるので、`docker run` を毎回書く代わりに
+関数3本を定義してある。中身は `scripts/docker-env.sh` を見ること。
+
+| 関数 | 何 |
+|---|---|
+| `cmoe1 <コマンド>` | **GPU 1枚だけ見せる。** 手順3 の smoke、手順4、手順5 はこれ |
+| `cmoeall <コマンド>` | 全部見せる。**preflight だけ**（枚数を数えるのが仕事なので絞らない） |
+| `cmoe_sweep` | 手順6 の常駐コンテナを起こす |
+
+**シェルを開き直すたびに `source` し直すこと。** 28時間の実行中に再接続したら、
+もう一度読んでから `docker logs` を見にいく。
+
+マウントはリポジトリ直下から**絶対パスで**組み立てる（スクリプト自身の位置から
+決めるので、どのディレクトリで `source` しても同じ場所を向く）。相対パスだと
+`.cache` と `result_logs` が黙って別の場所を向く。
 
 | ホスト | コンテナ | 何のため |
 |---|---|---|
 | `~/.cache/huggingface` | `/root/.cache/huggingface` | モデル28GB とデータセット。読むだけなので4ジョブで共有してよい |
-| `./.cache` | `/workspace/.cache` | **ベンチ専用の隔離した datasets キャッシュ。** 既定の HuggingFace キャッシュに新しい `datasets` が書いた索引が混じっていると、固定してある 2.21.0 が知らない特徴量の型で落ちる |
-| `./result_logs` | `/workspace/result_logs` | 一次データ。ジョブごとにディレクトリが分かれるので4本で共有してよい |
+| `<repo>/.cache` | `/workspace/.cache` | **ベンチ専用の隔離した datasets キャッシュ。** 既定の HuggingFace キャッシュに新しい `datasets` が書いた索引が混じっていると、固定してある 2.21.0 が知らない特徴量の型で落ちる |
+| `<repo>/result_logs` | `/workspace/result_logs` | 一次データ。ジョブごとにディレクトリが分かれるので4本で共有してよい |
 
-**`sweep.py` 以外は必ず1枚に絞る。** アダプタは `device_map='auto'` で読むので、
-2枚以上見えていると7Bが分割され、その実行が測る値だけが別のデバイス構成の
-ものになる。`run.py` の `require_single_gpu()` が止めるが、`cmoe1` を使えば
-引っかからない。
+コンテナ名は3本とも `kinoshita_cmoe-improve` で共通なので、**同時に2本走らせない**
+こと（名前が衝突する）。手順3〜5 は上から順に1本ずつなので問題にならない。
+
+**`preflight` と `sweep.py` 以外は必ず1枚に絞る。** アダプタは
+`device_map='auto'` で読むので、2枚以上見えていると7Bが分割され、その実行が
+測る値だけが別のデバイス構成のものになる。`run.py` の `require_single_gpu()` が
+止めるが、`cmoe1` を使えば引っかからない。
 
 ## 手順3 preflight
 
@@ -154,19 +160,16 @@ cmoe1 uv run python experiments/25_model_seeds/dense_ppl.py --model mistralai/Mi
 
 ## 手順6 20ジョブを配る
 
-38時間ではなく28時間だが、いずれにせよ接続を保ったままにはできない。
-**切り離して走らせ、ログを残す。**
+28時間かかるので、接続を保ったままにはできない。**切り離して走らせ、ログを残す。**
 
 ```
-docker run -d --name $NAME --gpus all $MOUNTS $IMAGE \
-  uv run python experiments/25_model_seeds/sweep.py --gpus 0,1,2,3
-
-docker logs -f $NAME          # 起動・完了・失敗の一覧はここにしか出ない
+cmoe_sweep                             # -d で起こす
+docker logs -f "$CMOE_NAME"            # 起動・完了・失敗の一覧はここにしか出ない
 ```
 
-**`--rm` を付けないこと。** 付けると終了後に `docker logs` で追えなくなる。
-代わりに、次に回すときは `docker rm $NAME` で先に片付ける（`--rm` 版の alias と
-同じ名前を使うので、残っていると衝突する）。
+**このコンテナだけ `--rm` を付けていない。** 付けると終了後に `docker logs` で
+追えなくなるためで、代わりに次に回す前へ `docker rm "$CMOE_NAME"` で片付ける
+（`cmoe1` / `cmoeall` と同じ名前を使うので、残っていると衝突する）。
 
 `sweep.py` は空いた GPU に次のジョブを渡すだけの配り役で、**1ジョブは1枚に
 閉じる**（`CUDA_VISIBLE_DEVICES` を1枚だけ見せる）。長い A=6 から先に投げるので、
