@@ -17,8 +17,9 @@
 # 満たしているが、**最初に preflight.py を通して確かめること**（sm_89 の
 # カーネルが cu128 ホイールに入っているかまで見る）。
 #
-#   docker build -t cmoe .
-#   docker run --rm --gpus all cmoe uv run python experiments/25_model_seeds/preflight.py
+#   docker build -t kinoshita/cmoe-improve .
+#   docker run --rm --name kinoshita_cmoe-improve --gpus all \
+#       kinoshita/cmoe-improve uv run python experiments/25_model_seeds/preflight.py
 #
 FROM python:3.11-slim
 

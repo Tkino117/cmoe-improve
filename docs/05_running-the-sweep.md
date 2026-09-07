@@ -35,8 +35,13 @@ Mistral は Llama より1割ほど遅い。**合計およそ110時間、4枚に�
 
 ```
 git clone <このリポジトリ> && cd cmoe-improve
-docker build -t cmoe .
+docker build -t kinoshita/cmoe-improve .
 ```
+
+イメージ名は `kinoshita/cmoe-improve`、コンテナ名は `kinoshita_cmoe-improve`。
+**この2つが出てくるのはこの文書と `Dockerfile` の冒頭コメントだけで、コードは
+docker の名前に一切依存していない**（`run.py` / `sweep.py` はコンテナの中でも
+外でも同じように動く）。
 
 CUDA はイメージに入れていない。torch のホイールが CUDA ランタイムを同梱して
 いるので、要るのはホスト側のドライバだけである。依存は build 時に
@@ -50,15 +55,20 @@ CUDA はイメージに入れていない。torch のホイールが CUDA ラン
 
 ```
 REPO=/abs/path/to/cmoe-improve
+IMAGE=kinoshita/cmoe-improve
+NAME=kinoshita_cmoe-improve
 MOUNTS="-v $HOME/.cache/huggingface:/root/.cache/huggingface \
         -v $REPO/.cache:/workspace/.cache \
         -v $REPO/result_logs:/workspace/result_logs"
 
 # 1枚だけ見せる版。sweep.py 以外はこちらを使う
-alias cmoe1="docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES=0 $MOUNTS cmoe"
-# 4枚見せる版。sweep.py と preflight だけ
-alias cmoeall="docker run --rm --gpus all $MOUNTS cmoe"
+alias cmoe1="docker run --rm --name $NAME --gpus all -e CUDA_VISIBLE_DEVICES=0 $MOUNTS $IMAGE"
+# 4枚見せる版。preflight だけ
+alias cmoeall="docker run --rm --name $NAME --gpus all $MOUNTS $IMAGE"
 ```
+
+`--rm` なので名前は終了時に解放される。**この2本は同時に走らせない**こと
+（名前が衝突する）。手順3〜5 は上から順に1本ずつなので問題にならない。
 
 | ホスト | コンテナ | 何のため |
 |---|---|---|
@@ -148,13 +158,15 @@ cmoe1 uv run python experiments/25_model_seeds/dense_ppl.py --model mistralai/Mi
 **切り離して走らせ、ログを残す。**
 
 ```
-docker run -d --name cmoe-sweep --gpus all $MOUNTS cmoe \
+docker run -d --name $NAME --gpus all $MOUNTS $IMAGE \
   uv run python experiments/25_model_seeds/sweep.py --gpus 0,1,2,3
 
-docker logs -f cmoe-sweep          # 起動・完了・失敗の一覧はここにしか出ない
+docker logs -f $NAME          # 起動・完了・失敗の一覧はここにしか出ない
 ```
 
-`--rm` を付けないこと。付けると終了後に `docker logs` で追えなくなる。
+**`--rm` を付けないこと。** 付けると終了後に `docker logs` で追えなくなる。
+代わりに、次に回すときは `docker rm $NAME` で先に片付ける（`--rm` 版の alias と
+同じ名前を使うので、残っていると衝突する）。
 
 `sweep.py` は空いた GPU に次のジョブを渡すだけの配り役で、**1ジョブは1枚に
 閉じる**（`CUDA_VISIBLE_DEVICES` を1枚だけ見せる）。長い A=6 から先に投げるので、
