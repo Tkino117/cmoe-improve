@@ -121,6 +121,43 @@ cmoe_sweep() {
         uv run python experiments/25_model_seeds/sweep.py --gpus 0,1,2,3
 }
 
+# 20ジョブの進み具合。**ホスト側のファイルを読むだけ**なので、sweep が回って
+# いる最中に何度呼んでもよいし、docker が要らない。
+#
+#   済   段の一覧（exp25_stages_*.json）が書かれた
+#   走行 ログはあるが一覧がまだ無い
+#   未   ログも無い
+cmoe_progress() {
+    _done=0
+    _running=0
+    for _model in llama2-7b mistral-7b; do
+        for _na in 6 4; do
+            for _seed in 0 1 2 3 4; do
+                _job="${_model}_a${_na}_seed${_seed}"
+                _stages="$CMOE_RESULTS/exp25_stages_${_job}.json"
+                _joblog="$CMOE_RESULTS/sweep_logs/${_job}.log"
+                if [ -f "$_stages" ]; then
+                    _done=$((_done + 1))
+                    printf '  済   %-26s %s\n' "$_job" \
+                        "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('%.1f時間'%(d.get('seconds',0)/3600))" "$_stages" 2>/dev/null)"
+                elif [ -f "$_joblog" ]; then
+                    _running=$((_running + 1))
+                    printf '  走行 %-26s %s\n' "$_job" \
+                        "$(grep -E '^=== 段' "$_joblog" | tail -1)"
+                fi
+            done
+        done
+    done
+    echo
+    echo "  済 $_done / 20   走行 $_running   未 $((20 - _done - _running))"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "  GPU: $(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
+    fi
+    echo "  配り役のログ: docker logs --tail 20 $CMOE_NAME"
+    echo "  ジョブ個別  : tail -f $CMOE_RESULTS/sweep_logs/<job>.log"
+    unset _done _running _model _na _seed _job _stages _joblog
+}
+
 cmoe_env() {
     echo "REPO    $CMOE_REPO"
     echo "DATA    $CMOE_DATA      （書き込むのはこの下だけ）"

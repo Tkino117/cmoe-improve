@@ -219,7 +219,20 @@ docker logs -f "$CMOE_NAME"            # 起動・完了・失敗の一覧はこ
 --seeds 3,4            特定の seed だけ
 ```
 
-ジョブ個別のログは `result_logs/sweep_logs/<model>_a<A>_seed<N>.log`。
+### 経過を見る
+
+再接続したら、まず `source scripts/docker-env.sh` を読み直す（関数と変数が要る）。
+
+```
+cmoe_progress                          # 20ジョブの済/走行/未、GPU 使用率
+docker logs --tail 20 "$CMOE_NAME"     # 配り役。起動・完了・失敗の一覧
+tail -f /data/kinoshita/cmoe-results/sweep_logs/<job>.log   # ジョブ1本の中身
+nvidia-smi                             # 4枚とも埋まっているか
+```
+
+`cmoe_progress` はホスト側のファイルを読むだけなので、何度呼んでもよい。
+「済」は段の一覧（`exp25_stages_*.json`）が書かれたもの、「走行」はログはあるが
+一覧がまだ無いものである。
 
 ### 途中で落ちたとき
 
