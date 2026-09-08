@@ -209,6 +209,17 @@ docker logs -f "$CMOE_NAME"            # 起動・完了・失敗の一覧はこ
 追えなくなるためで、代わりに次に回す前へ `docker rm "$CMOE_NAME"` で片付ける
 （`cmoe1` / `cmoeall` と同じ名前を使うので、残っていると衝突する）。
 
+### 途中の様子を見る
+
+```
+cmoe_status                    # 完了本数・失敗・GPU・走行中のジョブと段
+docker logs --tail 40 "$CMOE_NAME"
+```
+
+`cmoe_status` はホストでファイルを読むだけなので、コンテナに入らなくてよい。
+目安は **1時間あたり 0.7 本**（20本 ÷ 28時間）で、15時間なら10〜12本。
+これより大きく少なければ `nvidia-smi` で遊んでいる GPU が無いかを見る。
+
 `sweep.py` は空いた GPU に次のジョブを渡すだけの配り役で、**1ジョブは1枚に
 閉じる**（`CUDA_VISIBLE_DEVICES` を1枚だけ見せる）。長い A=6 から先に投げるので、
 最後に1本だけ残って3枚が遊ぶ形になりにくい。
@@ -219,20 +230,7 @@ docker logs -f "$CMOE_NAME"            # 起動・完了・失敗の一覧はこ
 --seeds 3,4            特定の seed だけ
 ```
 
-### 経過を見る
-
-再接続したら、まず `source scripts/docker-env.sh` を読み直す（関数と変数が要る）。
-
-```
-cmoe_progress                          # 20ジョブの済/走行/未、GPU 使用率
-docker logs --tail 20 "$CMOE_NAME"     # 配り役。起動・完了・失敗の一覧
-tail -f /data/kinoshita/cmoe-results/sweep_logs/<job>.log   # ジョブ1本の中身
-nvidia-smi                             # 4枚とも埋まっているか
-```
-
-`cmoe_progress` はホスト側のファイルを読むだけなので、何度呼んでもよい。
-「済」は段の一覧（`exp25_stages_*.json`）が書かれたもの、「走行」はログはあるが
-一覧がまだ無いものである。
+ジョブ個別のログは `result_logs/sweep_logs/<model>_a<A>_seed<N>.log`。
 
 ### 途中で落ちたとき
 

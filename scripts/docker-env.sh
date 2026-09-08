@@ -121,41 +121,33 @@ cmoe_sweep() {
         uv run python experiments/25_model_seeds/sweep.py --gpus 0,1,2,3
 }
 
-# 20ジョブの進み具合。**ホスト側のファイルを読むだけ**なので、sweep が回って
-# いる最中に何度呼んでもよいし、docker が要らない。
-#
-#   済   段の一覧（exp25_stages_*.json）が書かれた
-#   走行 ログはあるが一覧がまだ無い
-#   未   ログも無い
-cmoe_progress() {
-    _done=0
-    _running=0
-    for _model in llama2-7b mistral-7b; do
-        for _na in 6 4; do
-            for _seed in 0 1 2 3 4; do
-                _job="${_model}_a${_na}_seed${_seed}"
-                _stages="$CMOE_RESULTS/exp25_stages_${_job}.json"
-                _joblog="$CMOE_RESULTS/sweep_logs/${_job}.log"
-                if [ -f "$_stages" ]; then
-                    _done=$((_done + 1))
-                    printf '  済   %-26s %s\n' "$_job" \
-                        "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('%.1f時間'%(d.get('seconds',0)/3600))" "$_stages" 2>/dev/null)"
-                elif [ -f "$_joblog" ]; then
-                    _running=$((_running + 1))
-                    printf '  走行 %-26s %s\n' "$_job" \
-                        "$(grep -E '^=== 段' "$_joblog" | tail -1)"
-                fi
-            done
-        done
-    done
-    echo
-    echo "  済 $_done / 20   走行 $_running   未 $((20 - _done - _running))"
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        echo "  GPU: $(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
+# 走っている sweep の様子を1画面にまとめる。**コンテナに入らずホストで読む** —
+# 進捗は result_logs の下のファイルに出ているので、docker logs が要るのは
+# 「起動・完了・失敗」の一覧だけである
+cmoe_status() {
+    _total=20
+    _done=$(ls "$CMOE_RESULTS"/exp25_stages_*.json 2>/dev/null | wc -l)
+    echo "== 完了 $_done / $_total 本"
+    if docker inspect "$CMOE_NAME" >/dev/null 2>&1; then
+        echo "== コンテナ $(docker inspect -f '{{.State.Status}}（{{.State.StartedAt}} 開始）' "$CMOE_NAME")"
+        _failed=$(docker logs "$CMOE_NAME" 2>&1 | grep -c 失敗)
+        [ "$_failed" -gt 0 ] && echo "== **失敗 $_failed 本**" \
+            && docker logs "$CMOE_NAME" 2>&1 | grep 失敗
+    else
+        echo "== コンテナ $CMOE_NAME が無い（終わって片付けたか、まだ起こしていない）"
     fi
-    echo "  配り役のログ: docker logs --tail 20 $CMOE_NAME"
-    echo "  ジョブ個別  : tail -f $CMOE_RESULTS/sweep_logs/<job>.log"
-    unset _done _running _model _na _seed _job _stages _joblog
+    echo "== GPU"
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader 2>/dev/null \
+        | sed 's/^/   /'
+    echo "== 走行中のジョブと、いる段"
+    for _f in "$CMOE_RESULTS"/sweep_logs/*.log; do
+        [ -e "$_f" ] || continue
+        # 段の一覧が残っていれば済み。残っていなければまだ走っている
+        _name=$(basename "$_f" .log)
+        [ -e "$CMOE_RESULTS/exp25_stages_$_name.json" ] && continue
+        printf '   %-26s %s\n' "$_name" "$(grep -E '^=== 段' "$_f" | tail -1)"
+    done
+    unset _total _done _failed _f _name
 }
 
 cmoe_env() {
