@@ -23,6 +23,15 @@
     uv run python experiments/25_model_seeds/sweep.py --gpus 0,1,2,3 --models mistral-7b
     uv run python experiments/25_model_seeds/sweep.py --gpus 0,1,2,3 --dry-run
 
+**時間が足りないときは段を分ける。** MMLU（段4）は段3 と同じ配分を測り直す
+だけなので、後から独立に回せる。``--widths`` は先の回と揃えること — 揃えないと
+段4 の側が「まだ引いていない幅」の探索を始めてしまう。
+
+    # 先: 探索・採点・5タスクとPPL まで
+    ... sweep.py --gpus 0,1,2,3 --widths 4 --stages search,score,bench
+    # 後: MMLU だけ（同じ --widths で）
+    ... sweep.py --gpus 0,1,2,3 --widths 4 --stages mmlu
+
 **同じジョブを2枚に渡さない。** ジョブは (モデル, A, seed) で一意で、出力先も
 その3つで決まる。同じ ``result_logs`` を共有していても衝突しない。ただし
 **同じジョブを2回同時に走らせると衝突する**ので、この配り役を2つ立てないこと。
@@ -76,8 +85,13 @@ def stages_path(model, nactive, seed):
     return ROOT / 'result_logs' / f'exp25_stages_{job_name(model, nactive, seed)}.json'
 
 
-def is_done(model, nactive, seed):
-    """段の一覧が残っていれば済み。``run.py`` が最後に書く。"""
+def is_done(model, nactive, seed, stages):
+    """段の一覧が残っていれば済み。``run.py`` が最後に書く。
+
+    **求める段が全部入っているかで見る。** MMLU を後回しにした回では
+    'mmlu' が無い一覧が残るので、あとから --stages mmlu で回したときに
+    「済み」と誤判定されないようにする。
+    """
     path = stages_path(model, nactive, seed)
     if not path.exists():
         return False
@@ -85,10 +99,10 @@ def is_done(model, nactive, seed):
         record = json.loads(path.read_text())
     except json.JSONDecodeError:
         return False
-    return 'bench' in record and 'mmlu' in record
+    return all(name in record for name in stages)
 
 
-def launch(model, nactive, seed, gpu, widths):
+def launch(model, nactive, seed, gpu, widths, stages):
     """1ジョブを1枚の GPU で起こす。標準出力はジョブごとのログへ。"""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     name = job_name(model, nactive, seed)
@@ -108,7 +122,7 @@ def launch(model, nactive, seed, gpu, widths):
     environment.setdefault('TOKENIZERS_PARALLELISM', 'false')
     command = [sys.executable, str(HERE / 'run.py'),
                '--model', model, '--nactive', str(nactive), '--seed', str(seed),
-               '--widths', widths]
+               '--widths', widths, '--stages', stages]
     process = subprocess.Popen(command, cwd=ROOT, env=environment,
                                stdout=handle, stderr=subprocess.STDOUT)
     return {'name': name, 'gpu': gpu, 'process': process, 'handle': handle,
@@ -123,6 +137,11 @@ def main(argv=None):
     parser.add_argument('--nactives', default=','.join(str(a) for a in NACTIVES))
     parser.add_argument('--seeds', default=','.join(str(s) for s in SEEDS))
     parser.add_argument('--widths', default='2,3,4')
+    parser.add_argument('--stages', default='search,score,bench,mmlu',
+                        help='各ジョブで走らせる段。MMLU を後回しにするなら '
+                             'search,score,bench にして、あとから --stages mmlu で'
+                             '同じ配分を測り直す（段4 は段3 と同じ配分を引くので、'
+                             '先に段3 を通してあれば待ち無しで走る）')
     parser.add_argument('--poll', type=float, default=20.0,
                         help='空きを見に行く間隔（秒）')
     parser.add_argument('--dry-run', action='store_true',
@@ -131,14 +150,16 @@ def main(argv=None):
 
     gpus = [int(field) for field in args.gpus.split(',') if field.strip()]
     models = [field.strip() for field in args.models.split(',') if field.strip()]
+    stages = [field.strip() for field in args.stages.split(',') if field.strip()]
     nactives = [int(field) for field in args.nactives.split(',') if field.strip()]
     seeds = [int(field) for field in args.seeds.split(',') if field.strip()]
 
+    wanted = [name for name in stages if name in ('search', 'bench', 'mmlu')]
     pending = [job for job in jobs(models, nactives, seeds)
-               if not is_done(*job)]
+               if not is_done(*job, wanted)]
     skipped = len(jobs(models, nactives, seeds)) - len(pending)
 
-    log(f'GPU {gpus} / ジョブ {len(pending)} 本'
+    log(f'GPU {gpus} / 段 {",".join(stages)} / ジョブ {len(pending)} 本'
         + (f'（済み {skipped} 本は飛ばす）' if skipped else ''))
     for model, nactive, seed in pending:
         log(f'  {job_name(model, nactive, seed)}')
@@ -158,7 +179,7 @@ def main(argv=None):
         while queue and free:
             gpu = free.pop(0)
             model, nactive, seed = queue.pop(0)
-            entry = launch(model, nactive, seed, gpu, args.widths)
+            entry = launch(model, nactive, seed, gpu, args.widths, args.stages)
             running.append(entry)
             log(f'[{time.strftime("%H:%M:%S")}] 起動 {entry["name"]} → GPU{gpu} '
                 f'（残り {len(queue)} 本）')

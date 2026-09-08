@@ -412,7 +412,19 @@ def bench_stage(root, plan, seed, searched, kind='bench'):
 
 
 def summarize(path, payload):
-    """段の一覧と、測ったコードのコミットを残す。数値そのものは集計しない。"""
+    """段の一覧と、測ったコードのコミットを残す。数値そのものは集計しない。
+
+    **既にある一覧には上書きせず足す。** 段を分けて回すことがあるためで
+    （``--stages search,score,bench`` を先に通し、あとから ``--stages mmlu``）、
+    毎回まるごと書き直すと、後の回に含まれない段の記録が消える。消えると
+    ``sweep.py`` の ``is_done`` が「その段はまだ」と誤って判定する。
+    """
+    if path.exists():
+        try:
+            previous = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            previous = {}
+        payload = {**previous, **payload}
     payload = dict(payload)
     payload.update({
         'commit': subprocess.run(
