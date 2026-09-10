@@ -43,6 +43,12 @@ uv run cmoe search --calib benchchoice --oracle margin --search beam --width 2
 # 「評価指標を見て選ぶ」のではなく、探索と同じ目的関数で選ぶのに使う
 uv run cmoe score --oracle suffix_kl --alloc uniform3 --alloc uniform4
 
+# 静的プルーニングの対照。原典の定義（attn+FFN 全体の比）で 25% と 50%
+uv run cmoe prune --method flap,llm_pruner --sparsity 0.25,0.5 --scope block --bench
+
+# 同じ手法を FFN だけに限り、トークンあたりの活性パラメータを MoE 変換に揃える
+uv run cmoe prune --method flap --sparsity 0.25 --scope mlp --bench
+
 # 移送が既存の測定と同じ数字を出すかの確認
 uv run python experiments/00_anchor.py
 ```
@@ -66,9 +72,11 @@ src/cmoe/
   router/     [軸4] ルーター方式
   alloc/      [軸5] SA 配分。search（探索）と oracles（採点）に分かれる
   eval/       [軸6] PPL・選択問題ベンチマークと、対応のある比較の統計
+  prune/      [対照] 静的な構造化プルーニング（FLAP / LLM-Pruner）。MoE 変換を
+              通らない比較手法で、軸ではない
   assemble.py 組み立て役。軸どうしを繋ぐ知識はここにしか無い
   cli.py      唯一のドライバ（run = 変換して測る / search = 配分を探す /
-              score = 与えた配分を採点する）
+              score = 与えた配分を採点する / prune = 静的プルーニングの対照を測る）
 experiments/  1実験1ファイルの薄い設定
 tests/        CPU で数秒で回る動作確認
 ```
@@ -123,6 +131,15 @@ tests/        CPU で数秒で回る動作確認
   `alloc/order.py`（順序対照。配分の多重集合を保ったまま層の並びだけ崩す）。
   統計を作るのは `experiments/22_alloc_baselines/{owl,lexi}_probe.py` で、
   そこから先の写像は CPU だけで足りる
+- 静的プルーニングの対照（**MoE 変換を通らない**先行研究。どれも提案手法では
+  ない）: `prune/flap.py`（FLAP の WIFV + AL-AM + bias 補償）、
+  `prune/llm_pruner.py`（LLM-Pruner の block-wise Taylor。**追加学習は行わない**）。
+  ExpertWeaver Table 2 の training-free 比較と同じ顔ぶれである。スパース率は
+  `--scope` が2つの土俵を持つ — `block` は原典の定義（attn+FFN 全体の比）、
+  `mlp` は FFN だけを刈って**トークンあたりの活性パラメータを MoE 変換に揃える**。
+  この基盤の「25%」は FFN ニューロンの比なのでブロック全体では 16.71% にしか
+  ならず、同じ「25%」と書くと対照だけが1.5倍削ることになる。`summary.json` の
+  `accounting` が名目比と実効比の両方を残す。report/25
 - 評価: PPL と、選択問題ベンチマーク5タスク（`--bench`）
 
 ### 選択問題ベンチマーク

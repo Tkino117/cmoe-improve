@@ -36,6 +36,46 @@ def load(path):
         return json.load(handle)
 
 
+def run_label(run):
+    """run を1つの名前で呼ぶ。``cmoe run`` と ``cmoe prune`` の両方を受ける。
+
+    ``prune`` の run には配分もルーターも無い。手法とスパース率の組で呼ぶので、
+    ``--cand-alloc flap@block/0.25`` のように指定できる。
+    """
+    if 'allocation' in run:
+        return run['allocation']['name']
+    return f'{run["method"]}@{run["scope"]}/{run["sparsity"]:g}'
+
+
+def run_matches(run, alloc):
+    """``--base-alloc`` / ``--cand-alloc`` がこの run を指しているか。
+
+    探索が出した配分の ``name`` はどれも ``custom`` で、1つのディレクトリに
+    幅2/3/4 の3本が並ぶことがある。名前だけでは引けないので、**層ごとの値を
+    並べたベクトル**でも指せるようにする（``cmoe run --alloc`` に貼れる形と
+    同じ書き方である）。
+    """
+    if run_label(run) == alloc:
+        return True
+    values = run.get('allocation', {}).get('values')
+    return values is not None and ','.join(str(v) for v in values) == alloc
+
+
+def run_has_router(run, router):
+    return 'routers' not in run or router in run['routers']
+
+
+def run_ppl(run, router, dataset):
+    """``run`` は router ごとに割れているが、``prune`` は割れていない。"""
+    rows = run['ppl']
+    return rows[dataset] if dataset in rows else rows[router][dataset]
+
+
+def run_bench_path(run, router):
+    rows = run['bench_samples']
+    return rows if isinstance(rows, str) else rows[router]
+
+
 def pick(payloads, alloc, router):
     """(seed -> (ディレクトリ, run))。同じ配分・ルーターの run を seed で引く。
 
@@ -44,8 +84,13 @@ def pick(payloads, alloc, router):
     """
     rows = {}
     for path, payload in payloads.items():
+        # ``@last`` は「その実行に渡された最後の --alloc」を指す。探索が出した
+        # 配分は seed ごとに違うベクトルなので、ディレクトリを跨いで1つの名前で
+        # は指せない。experiments/06・07 は幅2/3/4 をこの順で渡しており、最後が
+        # 幅4 である（各ディレクトリの summary.json の arguments で確かめられる）
+        wanted = (payload['arguments']['alloc'][-1] if alloc == '@last' else alloc)
         for run in payload['runs']:
-            if run['allocation']['name'] != alloc or router not in run['routers']:
+            if not run_matches(run, wanted) or not run_has_router(run, router):
                 continue
             if run['seed'] in rows:
                 raise SystemExit(
@@ -62,8 +107,8 @@ def ppl_table(base, cand, base_router, cand_router, datasets):
     for name in datasets:
         strata, base_ppl, cand_ppl = [], [], []
         for seed in sorted(set(base) & set(cand)):
-            left = base[seed][1]['ppl'][base_router][name]
-            right = cand[seed][1]['ppl'][cand_router][name]
+            left = run_ppl(base[seed][1], base_router, name)
+            right = run_ppl(cand[seed][1], cand_router, name)
             base_ppl.append(left['ppl'])
             cand_ppl.append(right['ppl'])
             strata.append(paired_differences(
@@ -81,12 +126,10 @@ def ppl_table(base, cand, base_router, cand_router, datasets):
 def bench_table(base, cand, base_router, cand_router, reference):
     seeds = sorted(set(base) & set(cand))
     loaded = {
-        'base': [bench.load_samples(
-            os.path.join(base[s][0], base[s][1]['bench_samples'][base_router]))
-            for s in seeds],
-        'cand': [bench.load_samples(
-            os.path.join(cand[s][0], cand[s][1]['bench_samples'][cand_router]))
-            for s in seeds],
+        'base': [bench.load_samples(os.path.join(
+            base[s][0], run_bench_path(base[s][1], base_router))) for s in seeds],
+        'cand': [bench.load_samples(os.path.join(
+            cand[s][0], run_bench_path(cand[s][1], cand_router))) for s in seeds],
     }
     means = {}
     for side in ('base', 'cand'):

@@ -53,6 +53,10 @@ from cmoe.data.base import load_tokenizer
 from cmoe.data.harness import DEFAULT_CACHE as DEFAULT_BENCH_CACHE
 from cmoe.data.registry import load_calibration, load_evaluation, load_splits
 from cmoe.eval import bench, bench_stats
+from cmoe.prune.base import (accounting, apply_plan, model_shape,
+                             moe_activated_sparsity)
+from cmoe.prune.registry import METHODS as PRUNE_METHODS
+from cmoe.prune.registry import calibration_defaults, create_plan
 from cmoe.eval.ppl import evaluate_ppl
 from cmoe.eval.stats import paired_differences, stratified_paired_bootstrap
 from cmoe.router.diagnostics import gap_recovered
@@ -62,6 +66,9 @@ from cmoe.router.methods.score_calibration import GAIN_LIMIT
 from cmoe.router.registry import create_method, resolve_chain
 
 TEXT_NAME, JSON_NAME = 'run.txt', 'summary.json'
+# 構成の2つ組に付ける名前。run は (配分, ルーター)、prune は (手法, 設定)
+CONFIG_LABELS = ('allocation', 'router')
+PRUNE_LABELS = ('method', 'setting')
 SEARCH_JSON = 'search.json'
 SCORE_JSON = 'score.json'
 # 選択問題の生の尤度の置き場所。summary.json に混ぜないのは、1構成で 1MB 前後
@@ -194,6 +201,55 @@ def build_parser():
     run.add_argument('--bootstrap-reps', type=int, default=10000)
     run.add_argument('--bootstrap-seed', type=int, default=20260813)
     run.add_argument('--out', default=None)
+
+    prune = sub.add_parser(
+        'prune', help='静的な構造化プルーニングの対照を測る（提案手法ではない）')
+    prune.add_argument('--model', default='meta-llama/Llama-2-7b-hf')
+    prune.add_argument('--adapter', default=None, help='省略時はモデル名から推測する')
+    prune.add_argument('--method', default='flap',
+                       help=f'プルーニング手法。{sorted(PRUNE_METHODS)} から選ぶ')
+    prune.add_argument('--sparsity', default='0.25',
+                       help='スパース率。カンマ区切りで複数')
+    prune.add_argument(
+        '--scope', default='block',
+        help='スパース率の数え方。block=原典の定義（attn+FFN 全体の比。'
+             'ExpertWeaver Table 2 と同じ土俵） / '
+             'mlp=FFN だけを刈り、活性パラメータを提案手法に揃える')
+    prune.add_argument('--calib', default='slimpajama',
+                       help='キャリブレーションセット')
+    prune.add_argument('--calib-samples', type=int, default=None,
+                       help='省略時は手法ごとの原典の既定')
+    prune.add_argument('--calib-seqlen', type=int, default=None,
+                       help='省略時は手法ごとの原典の既定')
+    prune.add_argument('--seeds', default='0', help='キャリブレーションの seed')
+    prune.add_argument('--datasets', default='wikitext2,c4-new', help='評価セット')
+    prune.add_argument('--seqlen', type=int, default=2048,
+                       help='PPL の窓幅。校正の長さは --calib-seqlen で別に決める')
+    prune.add_argument('--batch-chunk', type=int, default=64,
+                       help='層0 の入力を捕まえるときに一度に通す系列数')
+    prune.add_argument('--nexperts', type=int, default=8,
+                       help='対照の MoE 変換の N。活性パラメータの基準を出すためだけ')
+    prune.add_argument('--nactive', type=int, default=6,
+                       help='対照の MoE 変換の A。同上')
+    prune.add_argument('--layer-start', type=int, default=None,
+                       help='LLM-Pruner が刈り始める層。既定は公式スクリプトの 4')
+    prune.add_argument('--layer-end', type=int, default=None,
+                       help='LLM-Pruner が刈り終える層（含まない）。既定は 30')
+    prune.add_argument('--no-ppl', action='store_true')
+    prune.add_argument('--bench', action='store_true',
+                       help='選択問題ベンチマークも測る')
+    prune.add_argument('--bench-tasks', default=','.join(bench.DEFAULT_TASKS))
+    prune.add_argument('--bench-limit', type=int, default=None)
+    prune.add_argument('--bench-batch-size', type=int, default=8)
+    prune.add_argument('--bench-fewshot', type=int, default=0)
+    prune.add_argument('--bench-max-length', type=int, default=None)
+    prune.add_argument('--bench-cache-dir', default=DEFAULT_BENCH_CACHE)
+    prune.add_argument('--bench-reference', default=None,
+                       help='測り済みの dense の bench/dense.json を基準に取り込む')
+    prune.add_argument('--no-bench-dense', action='store_true')
+    prune.add_argument('--bootstrap-reps', type=int, default=10000)
+    prune.add_argument('--bootstrap-seed', type=int, default=20260813)
+    prune.add_argument('--out', default=None)
 
     search = sub.add_parser('search', help='層ごとの x を探す')
     add_oracle_arguments(search, layers_help='先頭 N 層だけ探索する（配線確認用）')
@@ -488,12 +544,18 @@ def summarize_diagnostics(report):
     return summary
 
 
-def summarize(records, configs, datasets, reps, seed):
-    """構成ごとの平均 PPL と、先頭構成に対する対応のある差。"""
-    summary = {'configurations': [], 'baseline': f'{configs[0][0]}+{configs[0][1]}'}
+def summarize(records, configs, datasets, reps, seed, labels=CONFIG_LABELS):
+    """構成ごとの平均 PPL と、先頭構成に対する対応のある差。
+
+    ``labels`` は構成の2つ組に付ける名前である。``run`` では (配分, ルーター)、
+    ``prune`` では (手法, 設定) になる。ここが持っている知識は「先頭構成を対照に
+    取って対応のある差を出す」だけで、2つ組が何であるかには依らない。
+    """
+    summary = {'configurations': [], 'baseline': f'{configs[0][0]}+{configs[0][1]}',
+               'labels': list(labels)}
     baseline_key = configs[0]
     for config in configs:
-        row = {'allocation': config[0], 'router': config[1], 'datasets': {}}
+        row = {labels[0]: config[0], labels[1]: config[1], 'datasets': {}}
         for dataset in datasets:
             values = [record['ppl'][dataset].ppl
                       for record in records if record['config'] == config]
@@ -521,7 +583,8 @@ def summarize(records, configs, datasets, reps, seed):
     return summary
 
 
-def summarize_bench(records, configs, reference, reps, seed):
+def summarize_bench(records, configs, reference, reps, seed,
+                    labels=CONFIG_LABELS):
     """構成ごとの指標の平均と、先頭構成に対する対応のある差。
 
     再抽出の層は **(seed × タスク)** である。タスクごとに問題数が 1,200〜10,000
@@ -531,7 +594,7 @@ def summarize_bench(records, configs, reference, reps, seed):
     baseline_key = configs[0]
     summary = {'baseline': f'{baseline_key[0]}+{baseline_key[1]}',
                'reference': 'dense' if reference else None,
-               'configurations': []}
+               'labels': list(labels), 'configurations': []}
     for config in configs:
         mine = [record for record in records
                 if record['config'] == config and record.get('bench')]
@@ -540,7 +603,7 @@ def summarize_bench(records, configs, reference, reps, seed):
         per_seed = [bench_stats.summarize(record['bench'], reference)
                     for record in mine]
         row = {
-            'allocation': config[0], 'router': config[1], 'n_seeds': len(mine),
+            labels[0]: config[0], labels[1]: config[1], 'n_seeds': len(mine),
             'n_docs': per_seed[0]['n_docs'],
             'tasks': {
                 task: {metric: sum(one['tasks'][task][metric] for one in per_seed)
@@ -557,6 +620,37 @@ def summarize_bench(records, configs, reference, reps, seed):
                 list(per_seed[0]['macro']), reps, seed)
         summary['configurations'].append(row)
     return summary
+
+
+def log_summaries(payload, labels=CONFIG_LABELS):
+    """まとめの表を表示する。``run`` と ``prune`` で同じ形にする。"""
+    if 'summary' in payload:
+        log()
+        log('== まとめ (平均 PPL、小さいほど良い) ==')
+    for row in payload.get('summary', {}).get('configurations', []):
+        for dataset, entry in row['datasets'].items():
+            line = (f'{row[labels[0]]:>10} + {row[labels[1]]:<20} '
+                    f'{dataset:<10} {entry["mean_ppl"]:.6f}')
+            paired = entry.get('paired_vs_baseline')
+            if paired:
+                line += (f'  対照比 NLL {paired["mean_nll_difference"]:+.6f} '
+                         f'[{paired["lower"]:+.6f}, {paired["upper"]:+.6f}] '
+                         f'{paired["improved_seeds"]}/{paired["n_seeds"]} seed 改善')
+            log(line)
+    if 'bench_summary' in payload:
+        log()
+        log('== ベンチマーク（マクロ平均。acc/acc_norm/margin/ref_agreement は'
+            '大きいほど、gold_nll/ref_kl は小さいほど良い）==')
+        for row in payload['bench_summary']['configurations']:
+            head = f'{row[labels[0]]:>10} + {row[labels[1]]:<20}'
+            log(head + '  ' + '  '.join(
+                f'{metric}={value:.6f}' for metric, value in row['macro'].items()))
+            for metric, paired in row.get('paired_vs_baseline', {}).items():
+                log(f'{"":>10}   {metric:<16} 対照比 '
+                    f'{paired["mean_difference"]:+.6f} '
+                    f'[{paired["lower"]:+.6f}, {paired["upper"]:+.6f}] '
+                    f'{paired["improved_strata"]}/{paired["n_strata"]} '
+                    '(seed × タスク) 改善')
 
 
 def paired_bench(records, mine, baseline_key, reference, metrics, reps, seed):
@@ -758,33 +852,202 @@ def command_run(args):
                     args.bootstrap_seed)
             runlog.write_json(os.path.join(out, JSON_NAME), payload)
 
-    if 'summary' in payload:
-        log()
-        log('== まとめ (平均 PPL、小さいほど良い) ==')
-    for row in payload.get('summary', {}).get('configurations', []):
-        for dataset, entry in row['datasets'].items():
-            line = (f'{row["allocation"]:>10} + {row["router"]:<20} '
-                    f'{dataset:<10} {entry["mean_ppl"]:.6f}')
-            paired = entry.get('paired_vs_baseline')
-            if paired:
-                line += (f'  対照比 NLL {paired["mean_nll_difference"]:+.6f} '
-                         f'[{paired["lower"]:+.6f}, {paired["upper"]:+.6f}] '
-                         f'{paired["improved_seeds"]}/{paired["n_seeds"]} seed 改善')
-            log(line)
-    if 'bench_summary' in payload:
-        log()
-        log('== ベンチマーク（マクロ平均。acc/acc_norm/margin/ref_agreement は'
-            '大きいほど、gold_nll/ref_kl は小さいほど良い）==')
-        for row in payload['bench_summary']['configurations']:
-            head = f'{row["allocation"]:>10} + {row["router"]:<20}'
-            log(head + '  ' + '  '.join(
-                f'{metric}={value:.6f}' for metric, value in row['macro'].items()))
-            for metric, paired in row.get('paired_vs_baseline', {}).items():
-                log(f'{"":>10}   {metric:<16} 対照比 '
-                    f'{paired["mean_difference"]:+.6f} '
-                    f'[{paired["lower"]:+.6f}, {paired["upper"]:+.6f}] '
-                    f'{paired["improved_strata"]}/{paired["n_strata"]} '
-                    '(seed × タスク) 改善')
+    log_summaries(payload)
+    if failures:
+        log(f'失敗した構成: {len(failures)}')
+    runlog.close_mirror()
+    return 1 if failures else 0
+
+
+def prune_one(args, method, sparsity, seed, evaluation_sets):
+    """1手法 × 1スパース率 × 1 seed。モデルを読み、刈り、測る。
+
+    プルーニングは破壊的なので、構成ごとにモデルを読み直す（``run`` が変換ごとに
+    読み直すのと同じ理由）。
+    """
+    adapter_name = args.adapter or guess_adapter(args.model)
+    adapter = create_adapter(adapter_name, args.model, seqlen=args.seqlen)
+    adapter.to_device()
+    shape = model_shape(adapter)
+
+    n_samples, calib_seqlen = calibration_defaults(method)
+    n_samples = args.calib_samples or n_samples
+    calib_seqlen = args.calib_seqlen or calib_seqlen
+    calibration = load_calibration(
+        args.calib, args.model, calib_seqlen, n_samples, seed)
+    log(f'  calib: {calibration.name} {tuple(calibration.input_ids.shape)} '
+        f'hash={calibration.metadata()["token_hash"][:12]}')
+
+    kwargs = {}
+    if method == 'llm_pruner':
+        if args.layer_start is not None:
+            kwargs['layer_start'] = args.layer_start
+        if args.layer_end is not None:
+            kwargs['layer_end'] = args.layer_end
+    else:
+        kwargs['batch_chunk'] = args.batch_chunk
+
+    started = time.time()
+    plan = create_plan(method, adapter, calibration, sparsity, args.scope,
+                       log=log, **kwargs)
+    counts = accounting(plan, shape)
+    log(f'  計画 {time.time() - started:.1f}s  '
+        f'平均 intermediate={counts["mean_intermediate"]:.1f}/'
+        f'{shape["intermediate_size"]} '
+        f'平均 heads={counts["mean_heads"]:.1f}/{shape["n_heads"]}')
+    log(f'  実効 ブロック削減率={counts["effective_block_sparsity"]:.4f} '
+        f'FFN ニューロン率={counts["ffn_neuron_sparsity"]:.4f} '
+        f'（対照の MoE N={args.nexperts}/A={args.nactive} は '
+        f'{moe_activated_sparsity(shape, args.nexperts, args.nactive):.4f}）')
+    for note in plan.notes:
+        log(f'  注意: {note}')
+    apply_plan(adapter, plan)
+
+    results = {}
+    for dataset, token_set in evaluation_sets.items():
+        result = evaluate_ppl(adapter, token_set)
+        results[dataset] = result
+        log(f'  {dataset:<10} {result.ppl:.6f}')
+
+    bench_samples = {}
+    if args.bench:
+        started_bench = time.time()
+        bench_samples = bench.evaluate_bench(
+            adapter.model, load_tokenizer(args.model),
+            tasks=parse_list(args.bench_tasks),
+            batch_size=args.bench_batch_size, limit=args.bench_limit,
+            num_fewshot=args.bench_fewshot, max_length=bench_max_length(args),
+            cache_dir=args.bench_cache_dir or None, model_name=args.model)
+        rows = bench_stats.summarize(bench_samples)
+        for task, values in rows['tasks'].items():
+            log(f'  {task:<16} acc={values["acc"]:.4f} '
+                f'acc_norm={values["acc_norm"]:.4f} '
+                f'gold_nll={values["gold_nll"]:.6f}')
+        log(f'  {"macro":<16} acc={rows["macro"]["acc"]:.4f} '
+            f'acc_norm={rows["macro"]["acc_norm"]:.4f} '
+            f'gold_nll={rows["macro"]["gold_nll"]:.6f} '
+            f'({time.time() - started_bench:.1f}s)')
+
+    payload = {
+        'method': method,
+        'scope': args.scope,
+        'sparsity': sparsity,
+        'seed': seed,
+        'data': {'calibration': calibration.metadata()},
+        'plan': plan.as_dict(),
+        'accounting': counts,
+        'moe_reference': {
+            'n_experts': args.nexperts, 'n_active': args.nactive,
+            'activated_block_sparsity': moe_activated_sparsity(
+                shape, args.nexperts, args.nactive)},
+        'ppl': {dataset: result.as_dict() for dataset, result in results.items()},
+        'bench': bench_stats.summarize(bench_samples) if bench_samples else {},
+        'seconds': time.time() - started,
+    }
+    del adapter, plan
+    gc.collect()
+    torch.cuda.empty_cache()
+    return payload, results, bench_samples
+
+
+def command_prune(args):
+    """静的な構造化プルーニングの対照を測る。
+
+    ``run`` と同じ評価・同じまとめ方を通す。違うのは「モデルをどう小さくするか」
+    だけで、dense の基準も ``--bench-reference`` でそのまま共有できる。
+    """
+    methods = parse_list(args.method)
+    sparsities = [float(value) for value in parse_list(args.sparsity)]
+    seeds = parse_seeds(args.seeds)
+    datasets = parse_list(args.datasets)
+    for name in methods:
+        if name not in PRUNE_METHODS:
+            raise SystemExit(
+                f'未知のプルーニング手法 {name!r}。{sorted(PRUNE_METHODS)} から選ぶ')
+    if args.scope not in ('block', 'mlp'):
+        raise SystemExit(f'未知の scope {args.scope!r}（block / mlp）')
+
+    out = args.out or runlog.default_out_dir('prune')
+    runlog.prepare_out_dir(out, JSON_NAME)
+    runlog.open_mirror(os.path.join(out, TEXT_NAME))
+
+    configs = [(name, f'{args.scope}/{value:g}')
+               for name in methods for value in sparsities]
+    log(f'model={args.model} calib={args.calib} scope={args.scope}')
+    log(f'手法 {len(methods)} 種 × スパース率 {len(sparsities)} 種 × '
+        f'seed {len(seeds)} 本 = {len(configs) * len(seeds)} 構成')
+    log(f'出力 {out}')
+
+    evaluation_sets = {}
+    if not args.no_ppl:
+        evaluation_sets = {
+            name: load_evaluation(name, args.model, args.seqlen) for name in datasets}
+        for name, token_set in evaluation_sets.items():
+            meta = token_set.metadata()
+            log(f'評価 {name}: {meta["n_tokens"]} トークン '
+                f'hash={meta["token_hash"][:12]}')
+
+    payload = {
+        'arguments': vars(args),
+        'configurations': [{'method': m, 'setting': s} for m, s in configs],
+        'seeds': seeds,
+        'datasets': {name: token_set.metadata()
+                     for name, token_set in evaluation_sets.items()},
+        'runs': [],
+    }
+    reference = None
+    if args.bench:
+        os.makedirs(os.path.join(out, BENCH_DIR), exist_ok=True)
+        log(f'ベンチ {args.bench_tasks}'
+            + (f' limit={args.bench_limit}' if args.bench_limit else '')
+            + f' {args.bench_fewshot}-shot')
+        if args.bench_reference:
+            reference = adopt_dense_bench(args, out)
+        elif not args.no_bench_dense:
+            reference = measure_dense_bench(args, out)
+
+    records, failures = [], []
+    for seed in seeds:
+        for method, sparsity in [(m, float(s.split('/')[1])) for m, s in configs]:
+            log()
+            log(f'== seed {seed} / {method} / {args.scope} {sparsity:g} ==')
+            config = (method, f'{args.scope}/{sparsity:g}')
+            try:
+                run_payload, results, bench_samples = prune_one(
+                    args, method, sparsity, seed, evaluation_sets)
+            except Exception as error:  # 1構成の失敗で残りを捨てない
+                log(f'  失敗: {type(error).__name__}: {error}')
+                log(traceback.format_exc())
+                failures.append({'seed': seed, 'method': method,
+                                 'sparsity': sparsity,
+                                 'error': f'{type(error).__name__}: {error}'})
+                payload['failures'] = failures
+                runlog.write_json(os.path.join(out, JSON_NAME), payload)
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            index = len(payload['runs'])
+            payload['runs'].append(run_payload)
+            if bench_samples:
+                relative = os.path.join(BENCH_DIR, f'run{index:03d}_{method}.json')
+                runlog.write_json(
+                    os.path.join(out, relative),
+                    {name: row.as_dict() for name, row in bench_samples.items()})
+                run_payload['bench_samples'] = relative
+            records.append({'config': config, 'seed': seed, 'ppl': results,
+                            'bench': bench_samples})
+            if any(record['ppl'] for record in records):
+                payload['summary'] = summarize(
+                    [record for record in records if record['ppl']], configs,
+                    datasets, args.bootstrap_reps, args.bootstrap_seed,
+                    labels=PRUNE_LABELS)
+            if any(record['bench'] for record in records):
+                payload['bench_summary'] = summarize_bench(
+                    records, configs, reference, args.bootstrap_reps,
+                    args.bootstrap_seed, labels=PRUNE_LABELS)
+            runlog.write_json(os.path.join(out, JSON_NAME), payload)
+
+    log_summaries(payload, labels=PRUNE_LABELS)
     if failures:
         log(f'失敗した構成: {len(failures)}')
     runlog.close_mirror()
@@ -1200,6 +1463,8 @@ def main(argv=None):
         return command_search(args)
     if args.command == 'score':
         return command_score(args)
+    if args.command == 'prune':
+        return command_prune(args)
     raise SystemExit(f'未知のコマンド {args.command!r}')
 
 
