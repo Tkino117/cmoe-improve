@@ -55,7 +55,9 @@ class CMoECarver:
         return rates
 
     @torch.no_grad()
-    def carve(self, dense, rates, markers, n_shared, z=None):
+    def carve(self, dense, rates, markers, n_shared, z=None, layer=None):
+        """``layer`` は層番号。層ごとに外から用意した統計を読む方式だけが使う
+        （``carve/llama_moe.py`` の v2）。既定の経路は読まない。"""
         if not 0 <= n_shared < self.n_experts:
             raise ValueError(
                 f'n_shared={n_shared} は 0..{self.n_experts - 1} の外')

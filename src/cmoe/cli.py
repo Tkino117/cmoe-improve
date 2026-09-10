@@ -32,6 +32,7 @@
 
 import argparse
 import gc
+import json
 import os
 import time
 import traceback
@@ -131,6 +132,10 @@ def build_parser():
     run.add_argument('--router', default='cmoe',
                      help='ルーター方式（複数可）。方式4 は先行方式を自動で前に挿す')
     run.add_argument('--carver', default='cmoe', help='分割方式')
+    run.add_argument(
+        '--carve-scores', default=None,
+        help='層ごとの統計を外から読む分割方式（llama_moe_v2）に渡す JSON。'
+             'パスに {seed} を書くと seed ごとに差し替わる')
     run.add_argument('--calib', default='wikitext2', help='キャリブレーションセット')
     run.add_argument('--datasets', default='wikitext2,c4-new', help='評価セット')
     run.add_argument('--seeds', default='0', help='キャリブレーションの seed')
@@ -380,6 +385,21 @@ def load_carving_data(args, seed, methods):
     return splits.carve, splits.fit, validation
 
 
+def load_carve_scores(args, seed):
+    """層ごとの統計を読む分割方式に渡すもの。要らない方式では None。
+
+    パスの ``{seed}`` は seed に開く。**seed ごとに別のプローブを渡す**ための
+    ものであり、1本を全 seed で使い回すと「校正の seed を振った」ことにならない。
+    """
+    path = getattr(args, 'carve_scores', None)
+    if not path:
+        return None
+    with open(path.format(seed=seed)) as handle:
+        payload = json.load(handle)
+    return {index: torch.tensor(row, dtype=torch.float32)
+            for index, row in enumerate(payload['scores'])}
+
+
 def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
     """1配分 × 1 seed。要求された全ルーター方式を1回の変換でまかなう。"""
     adapter_name = args.adapter or guess_adapter(args.model)
@@ -405,7 +425,8 @@ def run_one(args, alloc_spec, router_names, seed, evaluation_sets):
 
     converter = Converter(
         adapter,
-        create_carver(args.carver, args.nexperts, k_act=args.k_act),
+        create_carver(args.carver, args.nexperts, k_act=args.k_act, seed=seed,
+                      scores=load_carve_scores(args, seed)),
         methods,
         n_experts=args.nexperts,
         k_act=args.k_act,

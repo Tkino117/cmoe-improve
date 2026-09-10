@@ -34,12 +34,22 @@ def profile(dense, z, k_act=4):
     return profile_layer(dense, z, k_act=k_act)
 
 
+def carver_extras(name, n_shared):
+    """方式ごとに追加で要るもの。中身は見ないので適当な値でよい。"""
+    if name != 'llama_moe_v2':
+        return {}
+    torch.manual_seed(0)
+    # 層ごと・クラスタごとの重要度。クラスタ数 = routed expert 数
+    return {'scores': {0: torch.rand(N_EXPERTS - n_shared, INTER)}}
+
+
 def test_every_registered_carver_makes_a_valid_partition(layer):
     dense, z = layer
     rates, markers = profile(dense, z)
     for name in CARVERS:
-        carver = create_carver(name, N_EXPERTS, k_act=4)
-        partition = carver.carve(dense, rates, markers, 2, z=z)
+        carver = create_carver(name, N_EXPERTS, k_act=4,
+                               **carver_extras(name, 2))
+        partition = carver.carve(dense, rates, markers, 2, z=z, layer=0)
         assert partition.n_shared == 2
         assert sum(len(group) for group in partition.expert_groups) == INTER
 

@@ -261,7 +261,7 @@ class LayerWalk:
                 f'{self.candidates(profile.layer)} に無い')
         carved = self.layer_factory(profile.dense, profile.rates, profile.markers,
                                     x, self.n_active_total - x,
-                                    z=profile.profile_z)
+                                    z=profile.profile_z, layer=profile.layer)
         if carved.n_shared != x or carved.topk != self.n_active_total - x:
             raise ValueError(
                 f'x={x} を渡したのに x={carved.n_shared} Top-K={carved.topk} '

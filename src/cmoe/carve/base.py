@@ -71,7 +71,8 @@ class CarveMethod(Protocol):
 
     name: str
 
-    def carve(self, dense, rates, markers, n_shared) -> Partition:
+    def carve(self, dense, rates, markers, n_shared, z=None,
+              layer=None) -> Partition:
         ...
 
 
