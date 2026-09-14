@@ -18,17 +18,26 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(ROOT, 'experiments'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import argparse                                             # noqa: E402
+
 import compare_runs                                          # noqa: E402
-from run import DENSE_REFERENCE, NSAMPLES, POINTS, SEEDS, V2_SHARED  # noqa: E402
+from run import (DENSE_REFERENCES, MODELS, NSAMPLES, POINTS,  # noqa: E402
+                 SEEDS, V2_SHARED, model_tag)
 
 from cmoe.eval import bench, bench_stats                     # noqa: E402
 
 TASKS = ('piqa', 'winogrande', 'arc_easy', 'arc_challenge', 'hellaswag')
 HEADS = ('PIQA', 'WinoG.', 'ARC-e', 'ARC-c', 'HellaS.')
 DATASETS = ('wikitext2', 'c4-new')
-DENSE_PPL = 'result_logs/dense_ppl_llama-2-7b-hf/dense_ppl.json'
-CONTROL = {6: 'result_logs/bench_slimpajama_seed{seed}',
-           4: 'result_logs/bench_slimpajama_a4_seed{seed}'}
+DENSE_PPL = {'llama2-7b': 'result_logs/dense_ppl_llama-2-7b-hf/dense_ppl.json',
+             'mistral-7b': 'result_logs/dense_ppl_mistral-7b-v0.1/dense_ppl.json'}
+# 現行 CMoE の分割の対照。``--method control`` で測り直したものがあればそれを、
+# 無ければ experiments/25 の既存の測定を使う（report/26 はこちらだった）
+CONTROL = {6: 'result_logs/bench_slimpajama{tag}_seed{seed}',
+           4: 'result_logs/bench_slimpajama{tag}_a4_seed{seed}'}
+REMEASURED = 'result_logs/moe28_control{tag}_a{nactive}_seed{{seed}}'
+# EW-rule（experiments/21）。配分は seed ごとに違うので ``ew_rule.json`` から引く
+EW = 'result_logs/ew_bench{tag}{suffix}_seed{{seed}}'
 
 
 def load(path):
@@ -36,21 +45,41 @@ def load(path):
         return json.load(handle)
 
 
-def beam4(suffix, seed):
-    record = load(f'result_logs/slimpajama{suffix}_w4_n{NSAMPLES}_seed{seed}/search.json')
+def beam4(tag, suffix, seed):
+    record = load(f'result_logs/slimpajama{tag}{suffix}'
+                  f'_w4_n{NSAMPLES}_seed{seed}/search.json')
     return ','.join(str(value) for value in record['allocation']['values'])
 
 
-def pick_across_seeds(template, alloc_of_seed):
+def ew_spec(tag, suffix, seed):
+    """その seed の EW-rule の配分。無ければ None。"""
+    path = f'result_logs/ew_bench{tag}{suffix}_seed{seed}/ew_rule.json'
+    if not os.path.exists(os.path.join(ROOT, path)):
+        return None
+    return ','.join(str(value) for value in load(path)['values'])
+
+
+def control_template(tag, nactive, seeds):
+    """対照の置き場所。測り直した control があればそちらを優先する。"""
+    remeasured = REMEASURED.format(tag=tag, nactive=nactive)
+    if all(os.path.exists(os.path.join(ROOT, remeasured.format(seed=seed),
+                                       'summary.json')) for seed in seeds):
+        return remeasured
+    return CONTROL[nactive].format(tag=tag, seed='{seed}')
+
+
+def pick_across_seeds(template, alloc_of_seed, SEEDS=SEEDS):
     """seed ごとにディレクトリも配分も違う run を1つに束ねる。"""
     rows = {}
     for seed in SEEDS:
         path = template.format(seed=seed)
-        if not os.path.exists(os.path.join(ROOT, path, 'summary.json')):
+        alloc = alloc_of_seed(seed)
+        if alloc is None or not os.path.exists(
+                os.path.join(ROOT, path, 'summary.json')):
             return None
         rows.update(compare_runs.pick(
             {path: load(os.path.join(path, 'summary.json'))},
-            alloc_of_seed(seed), 'cmoe'))
+            alloc, 'cmoe'))
     return rows
 
 
@@ -72,9 +101,9 @@ def cells(runs, reference):
                       + [f'{average:.2f}'])
 
 
-def dense_cells(reference):
+def dense_cells(reference, dense_ppl):
     dense = bench_stats.summarize(reference)
-    payload = load(DENSE_PPL)['results']
+    payload = load(dense_ppl)['results']
     return ' | '.join(
         [f'{payload["wikitext2"]["ppl"]:.2f}', f'{payload["c4-new"]["ppl"]:.2f}']
         + [f'{dense["tasks"][task]["acc"] * 100:.2f}' for task in TASKS]
@@ -82,15 +111,27 @@ def dense_cells(reference):
 
 
 def main():
-    reference = bench.load_samples(os.path.join(ROOT, DENSE_REFERENCE))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--model', default='llama2-7b', choices=sorted(MODELS))
+    parser.add_argument('--seeds', default=None, help='既定は 0,1,2')
+    args = parser.parse_args()
+    tag = model_tag(args.model)
+    seeds = (tuple(int(x) for x in args.seeds.split(',')) if args.seeds
+             else SEEDS)
+
+    reference = bench.load_samples(
+        os.path.join(ROOT, DENSE_REFERENCES[args.model]))
     columns = ('| WikiText-2 | C4 | ' + ' | '.join(HEADS) + ' | Avg. |')
     rule = '--:|' * (len(DATASETS) + len(TASKS) + 1)
+    print(f'{args.model}（{MODELS[args.model]}）/ seed '
+          f'{",".join(str(s) for s in seeds)}')
 
     for label, nactive, suffix in POINTS:
-        control = CONTROL[nactive]
-        v1 = f'result_logs/moe28_v1random_a{nactive}_seed{{seed}}'
-        v2 = f'result_logs/moe28_v2_a{nactive}_seed{{seed}}'
+        control = control_template(tag, nactive, seeds)
+        v1 = f'result_logs/moe28_v1random{tag}_a{nactive}_seed{{seed}}'
+        v2 = f'result_logs/moe28_v2{tag}_a{nactive}_seed{{seed}}'
         shared = f'uniform{V2_SHARED}'
+        print(f'\n（対照 = {control}）')
 
         print()
         print(f'### スパース率 {label}（A={nactive}）')
@@ -101,13 +142,17 @@ def main():
         print('|---|---|' + rule)
         for name, alloc_label, template, alloc_of_seed in (
                 ('提案（beam 幅4）', 'beam 幅4', control,
-                 lambda seed: beam4(suffix, seed)),
+                 lambda seed: beam4(tag, suffix, seed)),
+                ('EW-rule（ExpertWeaver の規則）', '規則が出す層別配分',
+                 EW.format(tag=tag, suffix=suffix),
+                 lambda seed: ew_spec(tag, suffix, seed)),
                 ('LLaMA-MoE（Random）', 'uniform0', v1,
                  lambda seed: 'uniform0'),
                 ('LLaMA-MoE-v2', shared, v2, lambda seed: shared)):
-            runs = pick_across_seeds(template, alloc_of_seed)
+            runs = pick_across_seeds(template, alloc_of_seed, seeds)
             print(f'| {name} | {alloc_label} | {cells(runs, reference)} |')
-        print(f'| dense（変換前） | — | {dense_cells(reference)} |')
+        print('| dense（変換前） | — | '
+              f'{dense_cells(reference, DENSE_PPL[args.model])} |')
 
         print()
         print('**分割だけの差（同じ配分どうし）**')
@@ -120,10 +165,10 @@ def main():
                 (shared, '現行 CMoE', control, lambda seed: shared),
                 (shared, 'LLaMA-MoE-v2', v2, lambda seed: shared),
                 ('beam 幅4', '現行 CMoE', control,
-                 lambda seed: beam4(suffix, seed)),
+                 lambda seed: beam4(tag, suffix, seed)),
                 ('beam 幅4', 'LLaMA-MoE（Random）', v1,
-                 lambda seed: beam4(suffix, seed))):
-            runs = pick_across_seeds(template, alloc_of_seed)
+                 lambda seed: beam4(tag, suffix, seed))):
+            runs = pick_across_seeds(template, alloc_of_seed, seeds)
             print(f'| {alloc_label} | {carver} | {cells(runs, reference)} |')
     return 0
 
