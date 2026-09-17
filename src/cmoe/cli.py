@@ -1200,6 +1200,10 @@ def check_search_arguments(args):
     測る前に断る。
     """
     check_search(args.search, args.width, args.lookahead)
+    if args.search == 'independent' and args.no_recheck:
+        # 層ごとのスコアは単独変換のモデルの値で、配分全体の値は測り直しでしか
+        # 作れない。測り直さないと search.json に score が残らない
+        raise SystemExit('--search independent は --no-recheck と両立しない')
     check_oracle_arguments(args)
 
 
@@ -1316,17 +1320,26 @@ def command_search(args):
         return 1
     seconds = time.time() - started
 
-    best_score = search.records[-1]['beam'][0]['score']
+    # 探索が使った分。配分全体を測る下の1回は探索のコストに入れない
+    spent, calls = oracle.spent, oracle.calls
+    whole_model = getattr(search, 'scores_whole_model', True)
+    if whole_model:
+        best_score = search.records[-1]['beam'][0]['score']
+    else:
+        # 記録のスコアは各層を単独で変換したモデルの値。配分全体の値はここで測る
+        log()
+        log('決まった配分を頭から測る（層ごとの値は単独変換のモデルのもの）...')
+        best_score = score_allocation(oracle, allocation).score
     payload.update({
         'allocation': allocation.metadata(),
         'score': best_score,
-        'spent': oracle.spent,
-        'calls': oracle.calls,
+        'spent': spent,
+        'calls': calls,
         'seconds': seconds,
     })
     log()
     log(f'{allocation.name}: score {best_score:.6e}  平均 x={allocation.mean_x:.2f}  '
-        f'コスト {oracle.spent:g} {oracle.cost_unit}（{oracle.calls} 回）')
+        f'コスト {spent:g} {oracle.cost_unit}（{calls} 回）')
     if partial:
         log(f'接頭辞 {alloc_flag(allocation)}（{n_layers}/{adapter.n_layers} 層。'
             'run --alloc は全層ぶんを要求するので、これは貼るためのものではない）')

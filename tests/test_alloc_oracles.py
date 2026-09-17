@@ -349,6 +349,37 @@ def test_the_dense_readout_is_reproducible(adapter):
     assert oracle.nondeterminism_floor() == 0.0
 
 
+def test_passing_a_layer_dense_is_the_layer_itself(adapter):
+    """dense のまま通した次の状態は、元の層をそのまま走らせた出力と同じ。
+
+    独立に決める探索は、これで先行層を未変換のまま次の層へ進む。ここが違えば、
+    層 ℓ の候補は「層 ℓ だけを変換したモデル」を測っていない。
+    """
+    oracle = SuffixKLOracle(make_walk(adapter))
+    walk = oracle.walk
+    root = walk.root()
+    passed = oracle.pass_dense(root, 0)
+    expected = adapter.forward_layer(0, walk.inputs.hidden,
+                                     walk.inputs.attention_mask,
+                                     walk.inputs.position_ids)
+    assert passed.depth == 1
+    assert oracle.calls == 0                     # 採点ではない
+    assert torch.equal(passed.hidden, expected.to(passed.hidden.device))
+
+
+def test_a_layer_converted_alone_reads_zero_when_everything_is_dense(adapter):
+    """全層を dense で通した状態から読むと、dense の読み出しそのものになる。"""
+    oracle = SuffixKLOracle(make_walk(adapter))
+    state = oracle.root()
+    for layer in range(adapter.n_layers):
+        state = oracle.pass_dense(state, layer)
+    logits = adapter.forward_suffix(adapter.n_layers, state.hidden,
+                                    oracle.walk.inputs, keep=oracle.keep)
+    kl, _ = kl_divergence(oracle.dense_logits, logits, oracle.token_chunk,
+                          oracle.weights)
+    assert kl == pytest.approx(0.0, abs=1e-6)
+
+
 def test_the_suffix_kl_counts_the_layers_it_actually_runs(adapter):
     oracle = SuffixKLOracle(make_walk(adapter))
     first, _, _, _ = measure_one(oracle, 2, layer=0)
@@ -514,6 +545,59 @@ def test_the_search_command_runs_end_to_end(tmp_path, monkeypatch):
     assert payload['recheck']['gap'] == 0.0
     assert payload['recheck']['score'] == payload['score']
     assert (out / 'run.txt').exists()
+
+
+def test_the_independent_search_command_scores_the_whole_allocation(
+        tmp_path, monkeypatch):
+    """``--search independent`` の score は、決まった配分全体を測った値である。
+
+    層ごとの記録は単独変換のモデルの値なので、最終層の記録を score にすると
+    配分全体とは別のモデルの数になる。
+    """
+    import cmoe.adapters.registry as adapters
+    import cmoe.data.registry as data
+    from cmoe.cli import main
+    from cmoe import runlog
+
+    def load_tiny(name, seqlen=SEQLEN, device=None):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        config = LlamaConfig(
+            vocab_size=128, hidden_size=64, intermediate_size=128,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+            max_position_embeddings=SEQLEN * 8)
+        torch.manual_seed(0)
+        model = LlamaForCausalLM(config).to(torch.bfloat16)
+        model.eval()
+        model.config.use_cache = False
+        return LlamaAdapter(model, seqlen=seqlen, device='cpu')
+
+    monkeypatch.setitem(adapters.ADAPTERS, 'tiny',
+                        type('Tiny', (), {'load': staticmethod(load_tiny)}))
+    monkeypatch.setitem(
+        data.CALIBRATION_SETS, 'tiny',
+        lambda model, seqlen, n, seed: token_set('tiny-calib', (n, seqlen), seed))
+
+    out = tmp_path / 'search'
+    code = main(['search', '--adapter', 'tiny', '--model', 'tiny',
+                 '--calib', 'tiny', '--oracle', 'suffix_kl',
+                 '--search', 'independent',
+                 '--nexperts', str(N_EXPERTS), '--nactive', str(N_ACTIVE),
+                 '--nsamples', '2', '--seqlen', str(SEQLEN), '--out', str(out)])
+    runlog.close_mirror()
+    assert code == 0
+
+    payload = json.loads((out / 'search.json').read_text())
+    values = payload['allocation']['values']
+    assert len(values) == 2
+    # 候補は x = 0..A で、層ごとに全部測る。配分全体の採点はコストに入れない
+    assert payload['calls'] == 2 * (N_ACTIVE + 1)
+    assert payload['recheck']['gap'] == 0.0
+    assert payload['recheck']['score'] == payload['score']
+    # 各層の記録は、その層の候補の最小
+    for record, x in zip(payload['layers'], values):
+        children = record['rows'][0]['children']
+        assert x == min(children, key=lambda c: (c['score'], c['x']))['x']
 
 
 def test_the_kl_matches_the_reference(adapter, xsearch):

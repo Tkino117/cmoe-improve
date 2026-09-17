@@ -24,6 +24,10 @@ TRAP = {
 }
 
 
+# 接頭辞の中で「その層は dense のまま通した」を表す印
+DENSE = 'D'
+
+
 class FakeOracle:
     """接頭辞 → スコアの表を引くだけのオラクル。状態は接頭辞そのもの。"""
 
@@ -66,6 +70,11 @@ class FakeOracle:
         return (ScoreResult(score=self.scores[prefix], cost=self.cost,
                             cost_unit=self.cost_unit, details={'x': x}),
                 prefix)
+
+    def pass_dense(self, state, layer):
+        if len(state) != layer:
+            raise AssertionError(f'深さ {len(state)} の接頭辞を層 {layer} で通した')
+        return state + (DENSE,)
 
 
 # -- 盤面 -------------------------------------------------------------------
@@ -301,6 +310,10 @@ def test_argument_errors_surface_before_the_model_is_loaded():
         check_search_arguments(parse('--search', 'annealing'))
     with pytest.raises(ValueError, match='幅1のビーム'):
         check_search_arguments(parse('--search', 'greedy', '--width', '4'))
+    with pytest.raises(ValueError, match='幅を取らない'):
+        check_search_arguments(parse('--search', 'independent', '--width', '1'))
+    with pytest.raises(SystemExit, match='--no-recheck'):
+        check_search_arguments(parse('--search', 'independent', '--no-recheck'))
     # --layers 0 は falsy なので、検査が無いと「全層」に化ける
     with pytest.raises(SystemExit, match='--layers'):
         check_search_arguments(parse('--layers', '0'))
@@ -404,3 +417,46 @@ def test_a_failing_lookahead_does_not_strand_the_states():
         create_search('beam', width=2, lookahead=1).search(oracle, 2)
     # 先読みに入る前の子（0,）も、根も、落ちた時点で手放している
     assert () in oracle.released and (0,) in oracle.released and (1,) in oracle.released
+
+
+# -- 独立に決める -------------------------------------------------------------
+
+# 層1 の候補は、層0 を dense で通した接頭辞の上でだけ測られる。層0 を変換した
+# 接頭辞の値（TRAP）とは食い違う順位にしてあり、取り違えると答えが変わる
+INDEPENDENT = {
+    (0,): 1.0, (1,): 0.5, (2,): 2.0,
+    (DENSE, 0): 0.3, (DENSE, 1): 0.2, (DENSE, 2): 0.9,
+}
+
+
+def test_independent_takes_the_argmin_of_each_layer_converted_alone():
+    oracle = FakeOracle(scores=dict(INDEPENDENT))
+    search = create_search('independent', n_active_total=2)
+    allocation = search.search(oracle, 2)
+    # 幅1 なら層1 は (1, x) の上で測られ x=0（0.9）になる。独立なら (D, x) で x=1
+    assert allocation.values == (1, 1)
+    assert search.scores_whole_model is False
+    assert oracle.calls == 2 * 3                  # 層数 × 候補数。幅1 と同じ
+
+
+def test_independent_hands_back_every_state():
+    oracle = FakeOracle(scores=dict(INDEPENDENT))
+    create_search('independent', n_active_total=2).search(oracle, 2)
+    # 候補の子6本と、根・層0 を dense で通した状態・最後の状態
+    assert sorted(oracle.released, key=str) == sorted(
+        [(0,), (1,), (2,), (DENSE, 0), (DENSE, 1), (DENSE, 2),
+         (), (DENSE,), (DENSE, DENSE)], key=str)
+
+
+def test_independent_breaks_ties_on_the_smaller_x():
+    scores = {(0,): 0.5, (1,): 0.5, (2,): 0.5}
+    allocation = create_search('independent', n_active_total=2).search(
+        FakeOracle(scores=scores), 1)
+    assert allocation.values == (0,)
+
+
+def test_independent_refuses_what_it_would_ignore():
+    with pytest.raises(ValueError, match='幅を取らない'):
+        create_search('independent', width=2)
+    with pytest.raises(ValueError, match='先読みしない'):
+        create_search('independent', lookahead=1)

@@ -282,6 +282,24 @@ class LayerWalk:
                            depth=profile.layer + 1)
 
     @torch.no_grad()
+    def propagate_dense(self, profile):
+        """この層を**変換せずに**通した出力 = 次の層への入力。
+
+        層を独立に決める探索が、決めた層を dense のまま次へ進むために要る。
+        伝播は ``propagate`` と同じ ``forward_chunked`` を通し、層だけを dense FFN
+        に替える。
+        """
+        dense = profile.dense
+
+        def ffn(z):
+            return dense.down_proj(hidden_activations(dense, z, normalize=False))
+
+        hidden = forward_chunked(ffn, profile.z, profile.residual,
+                                 batch_chunk=self.batch_chunk, device=self.device)
+        return PrefixState(hidden=hidden.to(self.state_device),
+                           depth=profile.layer + 1)
+
+    @torch.no_grad()
     def true_activations(self, profile):
         """真の中間活性 H を [トークン, ニューロン] で返す。
 
@@ -385,6 +403,19 @@ class PrefixOracleBase:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return result, child
+
+    @torch.no_grad()
+    def pass_dense(self, state, layer):
+        """層 ``layer`` を dense のまま通した次の状態を返す。採点はしない。
+
+        コストにも回数にも積まない。積むのは採点1回ぶんであって、dense の層を
+        1本通すのは採点ではない（その層の捕捉はすでに ``extend`` が作ってある）。
+        接頭辞のスコアはそのまま引き継ぐ — dense の層は誤差を足さない。
+        """
+        profile = self.walk.profile(state, layer)
+        child = self.walk.propagate_dense(profile)
+        child.score = state.score
+        return child
 
     def measure(self, profile, carved, state, child) -> ScoreResult:
         """この接頭辞のスコア。小さいほど良い。

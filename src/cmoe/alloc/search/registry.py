@@ -11,6 +11,7 @@
 
 from cmoe.alloc.presets import N_ACTIVE
 from cmoe.alloc.search.beam import BeamSearch, GreedySearch
+from cmoe.alloc.search.independent import IndependentSearch
 
 DEFAULT_BEAM_WIDTH = 4
 
@@ -29,10 +30,21 @@ def _greedy(width=None, **kwargs):
     return GreedySearch(**kwargs)
 
 
+def _independent(width=None, lookahead=0, **kwargs):
+    # 幅も深さも持たない。黙って無視すると、指定したつもりの表が別物になる
+    if width is not None:
+        raise ValueError(f'independent は幅を取らない（--width {width}）')
+    if lookahead:
+        raise ValueError(f'independent は先読みしない（--lookahead {lookahead}）')
+    return IndependentSearch(**kwargs)
+
+
 SEARCHES = {
     'beam': _beam,
     # 幅1のビームそのもの。別実装ではない
     'greedy': _greedy,
+    # 各層を単独で変換して決める。幅1 の対照
+    'independent': _independent,
 }
 
 
@@ -58,3 +70,7 @@ def check_search(name, width=None, lookahead=None):
         raise ValueError(
             f'greedy は幅1のビームそのもの。--width {width} と両立しない '
             '（幅を変えたいなら --search beam）')
+    if name == 'independent' and width is not None:
+        raise ValueError(f'independent は幅を取らない（--width {width}）')
+    if name == 'independent' and lookahead:
+        raise ValueError(f'independent は先読みしない（--lookahead {lookahead}）')
