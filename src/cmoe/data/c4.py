@@ -59,3 +59,33 @@ def evaluation(model, seqlen, name='c4-new'):
     text = ' '.join(validation[:VALIDATION_DOCS]['text'])
     ids = tokenizer(text, return_tensors='pt').input_ids[:, :VALIDATION_CHUNKS * seqlen]
     return TokenSet(f'{name}-validation', ids)
+
+
+def document_range(eval_seed):
+    """評価 seed k が使う文書の範囲。seed ごとに重ならない1100文書の塊。
+
+    seed 0 は先頭 1100 文書で、既存の測定と同一である。
+    """
+    if eval_seed < 0:
+        raise ValueError('評価 seed は 0 以上')
+    start = eval_seed * VALIDATION_DOCS
+    return start, start + VALIDATION_DOCS
+
+
+def evaluation_documents(model, seqlen, eval_seed, name='c4-new'):
+    """評価 seed ごとに別の文書で、既存と同じ切り方（256 塊）をする。"""
+    tokenizer = load_tokenizer(model)
+    validation = _validation()
+    start, stop = document_range(eval_seed)
+    if stop > len(validation):
+        raise ValueError(
+            f'評価 seed {eval_seed} は文書 {start}..{stop} を要るが、'
+            f'validation は {len(validation)} 文書しか無い')
+    text = ' '.join(validation[start:stop]['text'])
+    ids = tokenizer(text, return_tensors='pt').input_ids
+    if ids.shape[1] < VALIDATION_CHUNKS * seqlen:
+        raise ValueError(
+            f'評価 seed {eval_seed} の文書は {ids.shape[1]} トークンで、'
+            f'{VALIDATION_CHUNKS} 塊（{VALIDATION_CHUNKS * seqlen}）に足りない')
+    return TokenSet(f'{name}-validation@{eval_seed}',
+                    ids[:, :VALIDATION_CHUNKS * seqlen])

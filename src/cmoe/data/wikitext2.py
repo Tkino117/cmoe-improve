@@ -57,6 +57,26 @@ def evaluation(model, seqlen, name='wikitext2'):
     return TokenSet(f'{name}-test', ids)
 
 
+# 評価 seed ごとの区切りのずらし幅。test split は全体を使い切っているので、
+# 評価 seed で変えられるのは塊の境界だけである。11本（seed 0..10）が
+# seqlen の中に等間隔に並ぶ幅にしてある
+EVAL_OFFSET_DIVISIONS = 11
+
+
+def evaluation_offset(eval_seed, seqlen):
+    """評価 seed k の先頭の読み飛ばし量。seed 0 は 0（既存の測定と同一）。"""
+    if eval_seed < 0:
+        raise ValueError('評価 seed は 0 以上')
+    return (eval_seed * (seqlen // EVAL_OFFSET_DIVISIONS)) % seqlen
+
+
+def evaluation_shifted(model, seqlen, eval_seed, name='wikitext2'):
+    """test split 全体を、先頭を読み飛ばしてから塊に切る。文は同じで境界が変わる。"""
+    offset = evaluation_offset(eval_seed, seqlen)
+    base = evaluation(model, seqlen, name)
+    return TokenSet(f'{name}-test@{eval_seed}', base.input_ids[:, offset:])
+
+
 def _validation_text():
     from datasets import load_dataset
 

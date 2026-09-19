@@ -104,7 +104,25 @@ def load_calibration(name, model, seqlen, n_samples, seed):
     return loader(model, seqlen, n_samples, seed)
 
 
+# ``<名前>@<評価 seed>`` で引く評価セット。wikitext2 は test を使い切っているので
+# 塊の境界をずらし、c4-new は seed ごとに重ならない別の文書を使う
+SEEDED_EVALUATION_SETS = {
+    'wikitext2': wikitext2.evaluation_shifted,
+    'c4-new': c4.evaluation_documents,
+}
+
+
 def load_evaluation(name, model, seqlen):
+    base, marker, eval_seed = name.partition('@')
+    if marker:
+        try:
+            loader = SEEDED_EVALUATION_SETS[base]
+            eval_seed = int(eval_seed)
+        except (KeyError, ValueError):
+            raise ValueError(
+                f'評価セット {name!r} は <名前>@<評価 seed> の形で、名前は '
+                f'{sorted(SEEDED_EVALUATION_SETS)} から選ぶ') from None
+        return loader(model, seqlen, eval_seed)
     try:
         loader = EVALUATION_SETS[name]
     except KeyError:
